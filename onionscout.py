@@ -18,6 +18,7 @@ def show_help():
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
+v 0.0.1
 """
     console.print(ascii_logo)
     console.print("Usage:")
