@@ -52,11 +52,6 @@ Run a scan at Whonix Workstation
 onionscout -u <ONION_URL>
 ```
 
-Run via Tor proxy
-```bash
-onionscout -u -tor <ONION_URL>
-```
-
 ## Uninstall
 ```bash
 pipx uninstall onionscout
