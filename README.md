@@ -24,7 +24,7 @@ It will perform checks such as:
 ## Requirements
 
 - Python 3.8+  
-- Tor listening on `127.0.0.1:9050` if you want to use the `-tor` flag  (if you do not run it behind the Whonix Gateway).
+- Tor listening on `127.0.0.1:9050`
 - **pipx** (recommended)
 
 ## Installation via pipx
