@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=40.8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onionscout"
+version = "0.0.1"
+description = "CLI tool for basic Tor hidden-service (.onion) security checks"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "requests>=2.25",
+  "mmh3>=3.0",
+  "paramiko>=2.7",
+  "rich>=11.0"
+]
+
+[project.scripts]
+onionscout = "onionscout:main"
