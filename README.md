@@ -62,5 +62,5 @@ pipx uninstall onionscout
 
 ## Update
 ```bash
-pipx upgrade --spec git+https://github.com/h0ek/onionscout.git onionscout
+pipx upgrade onionscout
 ```
