@@ -21,8 +21,9 @@ def show_help():
 """
     console.print(ascii_logo)
     console.print("Usage:")
-    console.print("  onion-scout -h")
-    console.print("  onion-scout -u <ONION_URL> [-tor]")
+    console.print("  onionscout -h")
+    console.print("  onionscout -u <ONION_URL>")
+    console.print("  onionscout -u -tor <ONION_URL>")
 
 def get(url, proxies=None, **kwargs):
     return requests.get(url, proxies=proxies, timeout=10, **kwargs)
@@ -274,7 +275,7 @@ def main():
         show_help()
         return
     if "-u" not in sys.argv:
-        console.print("Usage: onion-scout -u <ONION_URL> [-tor]")
+        console.print("Check -h for usage")
         return
 
     url = sys.argv[sys.argv.index("-u")+1]
