@@ -21,15 +21,11 @@ It will perform checks such as:
 - `security.txt`  
 - External CAPTCHA resources (including EndGame’s `cap.lua` & `queue.html`)
 
----
-
 ## Requirements
 
 - Python 3.8+  
 - Tor listening on `127.0.0.1:9050` if you want to use the `-tor` flag  (if you do not run it behind the Whonix Gateway).
 - **pipx** (recommended)
-
----
 
 ## Installation via pipx
 
@@ -47,7 +43,7 @@ pipx install git+https://github.com/h0ek/onionscout.git
 ## Usage
 
 Show help
-``bash
+```bash
 onionscout -h
 ```
 
