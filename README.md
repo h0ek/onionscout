@@ -33,30 +33,34 @@ It will perform checks such as:
 
 ## Installation via pipx
 
-1. **Install pipx** (if you haven’t already):  
-   ```bash
-   python3 -m pip install --user pipx
-   pipx ensurepath
-   ```
+**Install pipx** (if you haven’t already):  
+```bash
+python3 -m pip install --user pipx
+pipx ensurepath
+```
 
-2. **Install onionscout**
-   ```bash
-   pipx install git+https://github.com/h0ek/onionscout.git
-   ```
+**Install onionscout**
+```bash
+pipx install git+https://github.com/h0ek/onionscout.git
+```
+
 ## Usage
-- Show help
-  ```bash
-  onionscout -h
 
-- Run a scan at Whonix Workstation
-  ```bash
-  onionscout -u <ONION_URL>
-  ```
+Show help
+``bash
+onionscout -h
+```
 
-- Run via Tor proxy
-  ```bash
-  onionscout -u -tor <ONION_URL>
-  ```
+Run a scan at Whonix Workstation
+```bash
+onionscout -u <ONION_URL>
+```
+
+Run via Tor proxy
+```bash
+onionscout -u -tor <ONION_URL>
+```
+
 ## Uninstall
 ```bash
 pipx uninstall onionscout
