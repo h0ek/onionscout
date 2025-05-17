@@ -1,5 +1,7 @@
 # onionscout
 
+![onionscout](onionscout.webp)
+
 **onionscout** is a lightweight CLI for basic security-checks of Tor hidden services (.onion).
 
 It will perform checks such as:
