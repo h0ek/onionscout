@@ -4,7 +4,10 @@
 
 **onionscout** is a lightweight CLI for basic security-checks of Tor hidden services (.onion).
 
-It will perform checks such as:
+> **Disclaimer:**  
+> This is *not* a full-blown pentesting or “super-hacker” tool. It’s a simple, low-hanging-fruit scanner designed to help you quickly spot common misconfigurations and basic information leaks on a Tor hidden service. Use it as a first pass, not a replacement for a thorough security audit.
+
+## Checks
 1. **Check Tor proxy**  
    - Calls `get("http://check.torproject.org", timeout=5)` via the shared `session` configured with `socks5h://127.0.0.1:9050`.  
    - Uses `requests`’ retry logic (5 attempts, exponential backoff) and a 5 s override timeout.  
@@ -77,13 +80,11 @@ It will perform checks such as:
     - Additionally searches for `/lua/cap.lua` and `/queue.html` occurrences, resolves relative paths to full URLs, and filters out `.onion` hosts — exposing external CAPTCHA services.
 
 ## Requirements
-
 - Python 3.8+  
 - Tor listening on `127.0.0.1:9050`
 - **pipx** (recommended)
 
 ## Installation via pipx
-
 **Install pipx** (if you haven’t already):  
 ```bash
 python3 -m pip install --user pipx
@@ -96,16 +97,29 @@ pipx install git+https://github.com/h0ek/onionscout.git
 ```
 
 ## Usage
-
 Show help
 ```bash
-onionscout -h
+onionscout
 ```
 
-Run a scan at Whonix Workstation
+Run a scan
 ```bash
 onionscout -u <ONION_URL>
 ```
+## Command-line Options
+
+The script accepts the following parameters:
+
+`-u, --url <onion_url>`  
+**Required.** The target .onion address to scan (e.g. `abcdef1234567890.onion`).
+
+`-t, --timeout <seconds>`  
+**Optional.** HTTP request timeout in seconds.  
+**Default:** `10.0`
+
+`-s, --sleep <seconds>`  
+**Optional.** Delay between each check, in seconds.  
+**Default:** `3.0`
 
 ## Uninstall
 ```bash
@@ -116,3 +130,6 @@ pipx uninstall onionscout
 ```bash
 pipx upgrade onionscout
 ```
+
+## ToDo
+I am thinking about some new options.
