@@ -1,104 +1,186 @@
 #!/usr/bin/env python3
 import sys
 import re
-import socket
+import time
+import argparse
 import requests
 import mmh3
 import paramiko
-from urllib.parse import urlparse
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+import uuid
+from io import BytesIO
+from PIL import Image
+from urllib.parse import urlparse, urljoin
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 from rich.console import Console
+from rich.table import Table
+from requests.exceptions import RequestException
+from paramiko import SSHException
 
-console = Console()
-
-def show_help():
-    ascii_logo = """
+ASCII_LOGO = r'''
  ▗▄▖ ▄▄▄▄  ▄  ▄▄▄  ▄▄▄▄       ▗▄▄▖▗▞▀▘ ▄▄▄  █  ▐▌   ■  
 ▐▌ ▐▌█   █ ▄ █   █ █   █     ▐▌   ▝▚▄▖█   █ ▀▄▄▞▘▗▄▟▙▄▖
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v 0.0.1
-"""
-    console.print(ascii_logo)
-    console.print("Usage:")
-    console.print("  onionscout -h")
-    console.print("  onionscout -u <ONION_URL>")
-    console.print("  onionscout -u -tor <ONION_URL>")
+v0.0.1
+'''
 
-def get(url, proxies=None, **kwargs):
-    return requests.get(url, proxies=proxies, timeout=10, **kwargs)
+console = Console()
+
+class Config:
+    def __init__(self, timeout: float, sleep: float):
+        self.timeout = timeout
+        self.sleep = sleep
+
+cfg = Config(timeout=10.0, sleep=3.0)
+
+session = requests.Session()
+session.proxies = {
+    "http":  "socks5h://127.0.0.1:9050",
+    "https": "socks5h://127.0.0.1:9050",
+}
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+                  "Gecko/20100101 Firefox/128.0"
+})
+retry = Retry(
+    total=5,
+    backoff_factor=0.5,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET"]
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+def get(url, **kwargs):
+    timeout = kwargs.pop('timeout', cfg.timeout)
+    return session.get(url, timeout=timeout, **kwargs)
+
+def show_help():
+    console.print(ASCII_LOGO)
+    print_help_body()
+
+def print_help_body():
+    console.print("Lightweight CLI for basic Tor hidden-service (.onion) security checks\n")
+    console.print("usage:")
+    console.print("  onionscout [-t TIMEOUT] [-s SLEEP] -u URL\n")
+    console.print("options:")
+    console.print("  -t TIMEOUT       HTTP timeout in seconds (default: 10.0)")
+    console.print("  -s SLEEP         seconds between checks (default: 3.0)")
+    console.print("  -u URL           .onion URL to scan (e.g. abcdef.onion)")
+
+class CustomParser(argparse.ArgumentParser):
+    def __init__(self, **kwargs):
+        super().__init__(add_help=False, **kwargs)
+
+    def print_usage(self, file=None):
+        pass
+
+    def error(self, message):
+        console.print(ASCII_LOGO)
+        console.print(f"[red]Error: {message}[/red]\n")
+        print_help_body()
+        sys.exit(2)
 
 def check_tor_proxy():
     try:
-        r = requests.get(
-            "http://check.torproject.org",
-            proxies={"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"},
-            timeout=5
-        )
+        r = get("http://check.torproject.org", timeout=5)
         return "Congratulations" in r.text
-    except:
+    except RequestException:
         return False
 
-def detect_server(url, proxies):
+def shodan_favicon_hash(raw_content: bytes) -> int:
+    img = Image.open(BytesIO(raw_content))
+    frames = []
     try:
-        r = get(url, proxies)
-        hdr = r.headers.get("Server", "")
-        err = r.text.lower() if r.status_code == 404 else ""
+        for i in range(img.n_frames):
+            img.seek(i)
+            frames.append(img.copy())
+    except (AttributeError, EOFError):
+        frames = [img]
+    best = max(frames, key=lambda im: im.width * im.height)
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    thumb = best.resize((16, 16), resample=resample).convert("L")
+    return mmh3.hash(thumb.tobytes(), signed=False)
+
+def detect_server(url):
+    try:
         out = []
+        r = get(url)
+        hdr = r.headers.get("Server", "")
         if hdr:
             out.append(f"Web server header: {hdr}")
-        if "apache" in err:
-            out.append("Web server (error page): Apache")
-        elif "nginx" in err:
-            out.append("Web server (error page): Nginx")
-        elif "lighttpd" in err:
-            out.append("Web server (error page): Lighttpd")
+        rand = uuid.uuid4().hex
+        r404 = get(f"{url.rstrip('/')}/{rand}")
+        if r404.status_code == 404:
+            m = re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?", r404.text.lower())
+            if m:
+                name = m.group(1).capitalize()
+                ver = m.group(2) or ""
+                out.append(f"Web server (error page): {name}{('/'+ver) if ver else ''}")
         return "\n".join(out) or "Web server not detected."
+    except RequestException as e:
+        return f"Error connecting (HTTP): {e}"
     except Exception as e:
-        return f"Error connecting: {e}"
+        return f"Unexpected error: {e}"
 
-def detect_favicon(url, proxies):
-    ico = url.rstrip("/") + "/favicon.ico"
+def detect_favicon(url):
+    ico = f"{url.rstrip('/')}/favicon.ico"
     try:
-        r = get(ico, proxies)
+        r = get(ico)
         if r.status_code == 200:
-            h = mmh3.hash(r.content)
-            return f"Favicon found at {ico}. MurmurHash3: {h}"
+            h = shodan_favicon_hash(r.content)
+            return f"Favicon found at {ico}. Shodan hash - http.favicon.hash:{h}"
         return "No favicon at /favicon.ico"
-    except:
+    except RequestException:
         return "No favicon at /favicon.ico"
-
-def detect_favicon_in_html(url, proxies):
-    try:
-        r = get(url, proxies)
-        m = re.search(r'<link\s+rel=["\']icon["\']\s+href=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
-        if m:
-            link = m.group(1)
-            fav = link if link.startswith("http") else url.rstrip("/") + link
-            rf = get(fav, proxies)
-            if rf.status_code == 200:
-                return f"Favicon in HTML: {fav}. MurmurHash3: {mmh3.hash(rf.content)}"
-        return "No favicon in HTML"
     except Exception as e:
-        return f"Error parsing HTML favicon: {e}"
+        return f"Error detecting favicon: {e}"
 
-def check_ssh_fingerprint(host):
+def detect_favicon_in_html(url):
+    try:
+        r = get(url)
+        m = re.search(
+            r'<link\s+[^>]*rel=["\'][^"\']*icon[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
+            r.text, re.IGNORECASE
+        )
+        if m:
+            href = m.group(1)
+            fav_url = urljoin(url, href)
+            rf = get(fav_url)
+            if rf.status_code == 200:
+                h = shodan_favicon_hash(rf.content)
+                return f"Favicon in HTML: {fav_url}. Shodan hash - http.favicon.hash:{h}"
+        return "No favicon in HTML"
+    except RequestException as e:
+        return f"Error fetching HTML/favicon: {e}"
+    except Exception as e:
+        return f"Unexpected error: {e}"
+
+def check_ssh_fingerprint(url):
+    host = urlparse(url).hostname or ""
     try:
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         c.connect(host, port=22, username="", password="", timeout=10)
         fp = c.get_transport().get_remote_server_key().get_fingerprint()
-        hexfp = ":".join(f"{b:02x}" for b in fp)
+        hex_fp = ":".join(f"{b:02x}" for b in fp)
         c.close()
-        return f"SSH Fingerprint: {hexfp}"
-    except:
-        return "SSH Fingerprint not available"
+        return f"SSH Fingerprint: {hex_fp}"
+    except SSHException as e:
+        return f"SSH error: {e}"
+    except Exception as e:
+        return f"Unexpected SSH error: {e}"
 
-def check_comments(url, proxies):
+def check_comments(url):
     try:
-        r = get(url, proxies)
-        cs = re.findall(r"<!--(.*?)-->", r.text, re.DOTALL)
+        r = get(url)
+        cs = re.findall(r"<!--([\s\S]*?)-->", r.text)
         if not cs:
             return "No comments in code"
         out = ["Comments in code:"]
@@ -106,10 +188,12 @@ def check_comments(url, proxies):
             for l in c.splitlines():
                 out.append(l.strip())
         return "\n".join(out)
+    except RequestException as e:
+        return f"Error fetching page: {e}"
     except Exception as e:
-        return f"Error checking comments: {e}"
+        return f"Unexpected error: {e}"
 
-def check_status_pages(url, proxies):
+def check_status_pages(url):
     pages = {
         "/server-status": "Apache mod_status/info",
         "/server-info":  "Apache mod_status/info",
@@ -119,216 +203,228 @@ def check_status_pages(url, proxies):
     ip_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     res = []
     for p, desc in pages.items():
-        u = url.rstrip("/") + p
         try:
-            r = get(u, proxies)
-            if r.status_code == 200:
+            r = get(f"{url.rstrip('/')}{p}")
+            if r.status_code in (200, 401, 403):
                 line = f"{p} ({desc}) accessible"
                 m = ip_re.search(r.text)
                 if m:
                     line += f"; leaked IP: {m.group()}"
                 res.append(line)
-        except:
-            pass
+        except RequestException:
+            continue
     return "\n".join(res) or "No status pages found"
 
-def check_files_and_paths(url, proxies):
-    files = ["info.php", ".git", ".svn", ".hg", ".env", ".DS_Store", "security.txt"]
+def check_files_and_paths(url):
+    items = ["info.php", ".git", ".svn", ".hg", ".env", ".DS_Store", "security.txt"]
     paths = ["backup", "admin", "secret"]
     found = []
-    for f in files:
-        u = url.rstrip("/") + "/" + f
+    for f in items + paths:
         try:
-            if get(u, proxies).status_code == 200:
-                found.append(f"File found: /{f}")
-        except:
-            pass
-    for p in paths:
-        u = url.rstrip("/") + "/" + p
-        try:
-            if get(u, proxies).status_code == 200:
-                found.append(f"Path found: /{p}")
-        except:
-            pass
+            r = get(f"{url.rstrip('/')}/{f}")
+            if r.status_code == 200:
+                prefix = "File" if f in items else "Path"
+                found.append(f"{prefix} found: /{f}")
+        except RequestException:
+            continue
     return "\n".join(found) or "No sensitive files or paths found"
 
-def check_external_resources(url, proxies):
+def check_external_resources(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         links = re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text)
-        out = []
-        for link in set(links):
-            host = urlparse(link).hostname or ""
-            if not host.endswith(".onion"):
-                out.append(link)
-        return "External resources loaded:\n" + "\n".join(out) if out else "No external resources detected"
+        ext = [l for l in set(links) if not urlparse(l).hostname.endswith(".onion")]
+        return "External resources:\n" + "\n".join(ext) if ext else "No external resources detected"
+    except RequestException as e:
+        return f"Error fetching resources: {e}"
     except Exception as e:
-        return f"Error checking external resources: {e}"
+        return f"Unexpected error: {e}"
 
-def check_cors(url, proxies):
+def check_cors(url):
     try:
-        r = get(url, proxies)
-        acao = r.headers.get("Access-Control-Allow-Origin")
-        return f"CORS header Access-Control-Allow-Origin: {acao}" if acao else "No CORS header"
+        r = get(url)
+        ac = {k: v for k, v in r.headers.items() if k.startswith("Access-Control-")}
+        return "CORS headers:\n" + "\n".join(f"{k}: {v}" for k, v in ac.items()) if ac else "No CORS headers"
+    except RequestException as e:
+        return f"Error fetching headers: {e}"
     except Exception as e:
-        return f"Error checking CORS headers: {e}"
+        return f"Unexpected error: {e}"
 
-def check_meta_redirects(url, proxies):
+def check_meta_redirects(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         metas = re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', r.text, re.IGNORECASE)
         out = []
         for m in metas:
-            cont = re.search(r'content=["\']([^"\']+)["\']', m, re.IGNORECASE)
-            if cont and "url=" in cont.group(1).lower():
-                target = cont.group(1).split("url=")[1]
-                if target.startswith("http://") or target.startswith("https://"):
-                    out.append(target)
-        return "Meta-refresh redirects to:\n" + "\n".join(out) if out else "No meta-refresh to clearnet URLs"
+            c = re.search(r'content=["\']([^"\']+)["\']', m, re.IGNORECASE)
+            if c and "url=" in c.group(1).lower():
+                tgt = c.group(1).split("url=")[1]
+                if tgt.startswith(("http://", "https://")):
+                    out.append(tgt)
+        return "Meta-refresh redirects:\n" + "\n".join(out) if out else "No meta-refresh to clearnet URLs"
+    except RequestException as e:
+        return f"Error fetching meta tags: {e}"
     except Exception as e:
-        return f"Error checking meta-refresh: {e}"
+        return f"Unexpected error: {e}"
 
-def check_robots_sitemap(url, proxies):
+def check_robots_sitemap(url):
     out = []
     for path in ["/robots.txt", "/sitemap.xml"]:
-        u = url.rstrip("/") + path
         try:
-            r = get(u, proxies)
+            r = get(f"{url.rstrip('/')}{path}")
             if r.status_code == 200:
                 if path == "/robots.txt":
-                    lines = [l for l in r.text.splitlines() if l.lower().startswith(("disallow:", "sitemap:"))]
+                    lines = [l for l in r.text.splitlines()
+                             if l.lower().startswith(("disallow:", "sitemap:"))]
                     if lines:
                         out.append(f"{path} entries:\n" + "\n".join(lines))
                 else:
                     locs = re.findall(r"<loc>([^<]+)</loc>", r.text)
                     if locs:
                         out.append(f"{path} locs:\n" + "\n".join(locs))
-        except:
-            pass
+        except RequestException:
+            continue
     return "\n\n".join(out) or "No robots.txt or sitemap.xml entries found"
 
-def check_form_actions(url, proxies):
+def check_form_actions(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         acts = re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
-        out = []
-        for a in set(acts):
-            if a.startswith("http://") or a.startswith("https://"):
-                if ".onion" not in urlparse(a).hostname:
-                    out.append(a)
+        out = [a for a in set(acts)
+               if a.startswith(("http://", "https://")) and not urlparse(a).hostname.endswith(".onion")]
         return "Form actions to clearnet:\n" + "\n".join(out) if out else "No clearnet form actions"
+    except RequestException as e:
+        return f"Error fetching forms: {e}"
     except Exception as e:
-        return f"Error checking form actions: {e}"
+        return f"Unexpected error: {e}"
 
-def check_websocket_endpoints(url, proxies):
+def check_websocket_endpoints(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         wss = re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text)
-        out = []
-        for ws in set(wss):
-            host = urlparse(ws).hostname or ""
-            if not host.endswith(".onion"):
-                out.append(ws)
+        out = [ws for ws in set(wss) if not urlparse(ws).hostname.endswith(".onion")]
         return "WebSocket endpoints to clearnet:\n" + "\n".join(out) if out else "No clearnet WebSocket endpoints"
+    except RequestException as e:
+        return f"Error fetching WebSocket endpoints: {e}"
     except Exception as e:
-        return f"Error checking WebSocket endpoints: {e}"
+        return f"Unexpected error: {e}"
 
-def check_proxy_headers(url, proxies):
+def check_proxy_headers(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         keys = ["X-Forwarded-For", "X-Real-IP", "Via", "Forwarded"]
         found = [f"{k}: {r.headers[k]}" for k in keys if k in r.headers]
         return "\n".join(found) if found else "No proxy-related headers"
+    except RequestException as e:
+        return f"Error fetching proxy headers: {e}"
     except Exception as e:
-        return f"Error checking proxy headers: {e}"
+        return f"Unexpected error: {e}"
 
-def check_security_txt(url, proxies):
+def check_security_txt(url):
     try:
-        u = url.rstrip("/") + "/.well-known/security.txt"
-        r = get(u, proxies)
+        r = get(f"{url.rstrip('/')}/.well-known/security.txt")
         return "security.txt:\n" + r.text.strip() if r.status_code == 200 else "security.txt not found"
+    except RequestException as e:
+        return f"Error fetching security.txt: {e}"
     except Exception as e:
-        return f"Error checking security.txt: {e}"
+        return f"Unexpected error: {e}"
 
-def check_captcha_leak(url, proxies=None):
+def check_captcha_leak(url):
     try:
-        r = get(url, proxies)
+        r = get(url)
         if r.status_code != 200:
             return "No page to check for CAPTCHA leaks"
         text = r.text.lower()
-        leaks = set()
-        for match in re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, re.IGNORECASE):
-            leaks.add(match)
+        leaks = set(re.findall(
+            r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, re.IGNORECASE))
         for path in ("/lua/cap.lua", "/queue.html"):
             if path in text:
                 for m in re.findall(r'["\']([^"\']+' + re.escape(path) + r')["\']', text):
-                    full = m if m.startswith("http") else url.rstrip("/") + m
+                    full = m if m.startswith("http") else f"{url.rstrip('/')}{m}"
                     leaks.add(full)
-        real_leaks = [u for u in leaks if not urlparse(u).hostname.endswith(".onion")]
-        if not real_leaks:
-            return "No external CAPTCHA resources detected"
-        return "Possible CAPTCHA leaks:\n  " + "\n  ".join(real_leaks)
+        real = [u for u in leaks if not urlparse(u).hostname.endswith(".onion")]
+        return "Possible CAPTCHA leaks:\n" + "\n".join(real) if real else "No external CAPTCHA resources detected"
+    except RequestException as e:
+        return f"Error fetching page: {e}"
     except Exception as e:
-        return f"Error checking CAPTCHA leaks: {e}"
+        return f"Unexpected error: {e}"
 
 def main():
-    if "-h" in sys.argv:
+    if len(sys.argv) == 1:
         show_help()
-        return
-    if "-u" not in sys.argv:
-        console.print("Check -h for usage")
-        return
+        sys.exit(0)
 
-    url = sys.argv[sys.argv.index("-u")+1]
-    use_tor = "-tor" in sys.argv
+    parser = CustomParser(
+        description="Lightweight CLI for basic Tor hidden-service (.onion) security checks"
+    )
+    parser.add_argument("-t", "--timeout", type=float, default=10.0,
+                        help="HTTP timeout in seconds (default: 10.0)")
+    parser.add_argument("-s", "--sleep", type=float, default=3.0,
+                        help="Seconds between checks (default: 3.0)")
+    parser.add_argument("-u", "--url", required=True,
+                        help=".onion URL to scan (e.g. abcdef.onion)")
+    args = parser.parse_args()
 
-    proxies = None
-    tasks = []
+    cfg.timeout = args.timeout
+    cfg.sleep   = args.sleep
 
-    # Build task list
-    if use_tor:
-        tasks.append(("Check Tor proxy", lambda: "OK" if check_tor_proxy() else "FAILED"))
-    else:
-        tasks.append(("Skip Tor proxy", lambda: "SKIPPED"))
+    raw = args.url
+    if not raw.startswith(("http://", "https://")):
+        raw = "http://" + raw
+    dom = urlparse(raw).netloc.lower()
+    if not dom.endswith(".onion"):
+        console.print(ASCII_LOGO)
+        console.print("[red]Error: Provide a valid .onion URL[/red]\n")
+        show_help()
+        sys.exit(1)
+    url = f"http://{dom}"
 
-    tasks.extend([
-        ("Detect server", lambda: detect_server(url, proxies)),
-        ("Detect favicon", lambda: detect_favicon(url, proxies)),
-        ("Favicon in HTML", lambda: detect_favicon_in_html(url, proxies)),
-        ("SSH fingerprint", lambda: check_ssh_fingerprint(url)),
-        ("Comments in code", lambda: check_comments(url, proxies)),
-        ("Status pages", lambda: check_status_pages(url, proxies)),
-        ("Files & paths", lambda: check_files_and_paths(url, proxies)),
-        ("External resources", lambda: check_external_resources(url, proxies)),
-        ("CORS headers", lambda: check_cors(url, proxies)),
-        ("Meta-refresh", lambda: check_meta_redirects(url, proxies)),
-        ("Robots & sitemap", lambda: check_robots_sitemap(url, proxies)),
-        ("Form actions", lambda: check_form_actions(url, proxies)),
-        ("WebSocket endpoints", lambda: check_websocket_endpoints(url, proxies)),
-        ("Proxy headers", lambda: check_proxy_headers(url, proxies)),
-        ("security.txt", lambda: check_security_txt(url, proxies)),
-        ("CAPTCHA leak", lambda: check_captcha_leak(url, proxies)),
-    ])
+    if not check_tor_proxy():
+        console.print(ASCII_LOGO)
+        console.print("[red]Tor proxy not working; start Tor on 127.0.0.1:9050[/red]\n")
+        show_help()
+        sys.exit(1)
 
-    # Perform tasks with progress
+    console.print(ASCII_LOGO)
+
+    tasks = [
+        ("Check Tor proxy",     lambda: "OK"),
+        ("Detect server",       lambda: detect_server(url)),
+        ("Detect favicon",      lambda: detect_favicon(url)),
+        ("Favicon in HTML",     lambda: detect_favicon_in_html(url)),
+        ("SSH fingerprint",     lambda: check_ssh_fingerprint(url)),
+        ("Comments in code",    lambda: check_comments(url)),
+        ("Status pages",        lambda: check_status_pages(url)),
+        ("Files & paths",       lambda: check_files_and_paths(url)),
+        ("External resources",  lambda: check_external_resources(url)),
+        ("CORS headers",        lambda: check_cors(url)),
+        ("Meta-refresh",        lambda: check_meta_redirects(url)),
+        ("Robots & sitemap",    lambda: check_robots_sitemap(url)),
+        ("Form actions",        lambda: check_form_actions(url)),
+        ("WebSocket endpoints", lambda: check_websocket_endpoints(url)),
+        ("Proxy headers",       lambda: check_proxy_headers(url)),
+        ("security.txt",        lambda: check_security_txt(url)),
+        ("CAPTCHA leak",        lambda: check_captcha_leak(url)),
+    ]
+    total = len(tasks)
     results = []
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), console=console) as prog:
-        task = prog.add_task("", total=len(tasks))
-        for desc, fn in tasks:
-            prog.update(task, description=f"[cyan]{desc}: in progress")
-            try:
-                out = fn()
-                status = "done" if not out.lower().startswith("error") and out not in ("FAILED",) else "failed"
-            except Exception:
-                out = "Error during task"
-                status = "failed"
-            prog.update(task, description=f"[cyan]{desc}: [green]{status}" if status=="done" else f"[cyan]{desc}: [red]{status}")
-            prog.advance(task)
-            results.append((desc, out))
 
-    console.print("\n[bold]Results:[/bold]")
+    for idx, (desc, fn) in enumerate(tasks, start=1):
+        with console.status(f"{idx}/{total} {desc}: in progress"):
+            out = fn()
+            time.sleep(cfg.sleep)
+        console.print(f"[green]{idx}/{total} {desc}: done[/green]")
+        results.append((desc, out))
+
+    console.print("\n[bold green]All steps complete[/bold green]\n")
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Check")
+    table.add_column("Result")
     for desc, out in results:
-        console.print(f"[yellow]{desc}[/yellow]:\n{out}\n")
+        table.add_row(desc, out.replace("\n", " | "))
+    console.print(table)
+
 
 if __name__ == "__main__":
     main()
