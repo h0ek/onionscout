@@ -5,23 +5,76 @@
 **onionscout** is a lightweight CLI for basic security-checks of Tor hidden services (.onion).
 
 It will perform checks such as:
-01. Check Tor proxy: Verifies that the local Tor SOCKS proxy is running and functional.
-02. Detect server: Sends an HTTP request, reads the Server header or error page text, and reports Apache, Nginx, Lighttpd, or “not detected.”
-03. Detect favicon: Fetches /favicon.ico, resizes it to 16×16, converts to grayscale, and computes an unsigned MurmurHash3.
-04. Favicon in HTML: Parses <link rel="…icon"> tags in the page, fetches that file, and computes the same Shodan–style hash.
-05. SSH fingerprint: Opens an SSH connection to port 22, retrieves the server’s public-key fingerprint, and prints it in hex.
-06. Comments in code: Scans the HTML for <!-- ... --> blocks and lists any inline comments.
-07. Status pages: Probes common status endpoints (/server-status, /status, etc.), notes which are accessible, and flags any leaked IPv4 addresses.
-08. Files & paths: Checks for sensitive files (.git, .env, security.txt, etc.) and directories (/admin, /backup, /secret).
-09. External resources: Extracts all src/href URLs, filters out .onion hosts, and lists any clearnet assets.
-10. CORS headers: Reads the Access-Control-Allow-Origin header and reports its value (or absence).
-11. Meta-refresh: Finds <meta http-equiv="refresh"> tags that redirect to clearnet URLs.
-12. Robots & sitemap: Fetches /robots.txt and /sitemap.xml, then prints any Disallow: or Sitemap: lines and <loc> entries.
-13. Form actions: Looks for <form action="…"> attributes pointing to clearnet hosts.
-14. WebSocket endpoints: Searches for new WebSocket("ws://…") calls that connect to non-onion hosts.
-15. Proxy headers: Checks response headers (X-Forwarded-For, X-Real-IP, Via, Forwarded) and shows any values.
-16. security.txt: Fetches /.well-known/security.txt and prints its contents if found.
-17. CAPTCHA leak: Scans page text for external CAPTCHA URLs or scripts (e.g. /lua/cap.lua) and lists any clearnet references.
+1. **Check Tor proxy**  
+   - Calls `get("http://check.torproject.org", timeout=5)` via the shared `session` configured with `socks5h://127.0.0.1:9050`.  
+   - Uses `requests`’ retry logic (5 attempts, exponential backoff) and a 5 s override timeout.  
+   - Returns `True` if the HTML response contains the string `"Congratulations"`, indicating a working Tor exit.
+
+2. **Detect server**  
+   - `get(url)` fetches the homepage and inspects `r.headers.get("Server")`.  
+   - Generates a random UUID path and requests `GET url/UUID`. If it returns 404, inspects the body via `re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?")` to infer server type and version from default error pages.
+
+3. **Detect favicon**  
+   - Downloads `/favicon.ico` with `get()`.  
+   - Loads the raw bytes into a PIL `Image`, iterates all ICO frames (`img.n_frames`), picks the one with the largest width×height.  
+   - Resizes to 16×16 using Lanczos, converts to 8-bit grayscale (`convert("L")`), and hashes the pixel buffer with MurmurHash3 (`mmh3.hash(..., signed=False)`).
+
+4. **Favicon in HTML**  
+   - Fetches the homepage HTML, applies regex `r'<link\s+[^>]*rel=["\'][^"\']*icon[^"\']*["\'][^>]*href=["\']([^"\']+)'` to locate any `<link rel=...icon href=...>` tag.  
+   - Resolves relative URLs via `urljoin`, re-downloads that file, and hashes it exactly as in step 3.
+
+5. **SSH fingerprint**  
+   - Parses the hostname from `urlparse(url).hostname`.  
+   - Uses Paramiko’s `SSHClient`, connects to port 22 with a 10 s timeout and `AutoAddPolicy()`.  
+   - Calls `get_remote_server_key().get_fingerprint()`, formats the byte fingerprint into colon-separated hex.
+
+6. **Comments in code**  
+   - Downloads the page HTML, finds all `<!-- … -->` blocks with `re.findall(r"<!--([\s\S]*?)-->", r.text)`.  
+   - Splits each comment on newlines and trims whitespace, collecting any developer notes or hidden tokens.
+
+7. **Status pages**  
+   - Iterates known endpoints: `/server-status`, `/server-info`, `/status`, `/webdav`.  
+   - For each, issues `get(url + path)`. If `r.status_code` is 200, 401 or 403, notes accessibility.  
+   - Uses `re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")` on the body to detect any raw IPv4 leakage.
+
+8. **Files & paths**  
+   - Checks common sensitive items: files (`info.php`, `.git`, `.env`, `security.txt`, etc.) and directories (`admin`, `backup`, `secret`).  
+   - For each entry, does `get(url + "/" + entry)`, reports any that return HTTP 200.
+
+9. **External resources**  
+   - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']')`.  
+   - Filters out URLs whose hostname ends with `.onion`, listing any clearnet dependencies (JS, CSS, images).
+
+10. **CORS headers**  
+    - After `get(url)`, iterates `r.headers.items()`, selects any keys starting with `Access-Control-`.  
+    - Prints each header:value or “No CORS headers” if none found.
+
+11. **Meta-refresh**  
+    - Finds `<meta http-equiv="refresh" ...>` tags via `re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', ...)`.  
+    - Extracts the `content="…url=TARGET"` portion, and if `TARGET` begins with `http://` or `https://`, reports it as a clearnet redirect.
+
+12. **Robots & sitemap**  
+    - Fetches `/robots.txt`, filters lines that start with `Disallow:` or `Sitemap:`.  
+    - Fetches `/sitemap.xml`, extracts all URLs inside `<loc>…</loc>` tags via `re.findall`.
+
+13. **Form actions**  
+    - Searches HTML for `<form ... action="…">` with `re.findall`.  
+    - Reports any actions pointing to non-`.onion` hosts (i.e. `action="http://..."`), which could leak form data.
+
+14. **WebSocket endpoints**  
+    - Uses regex `re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', ...)` to detect JavaScript WS/WSS connections.  
+    - Filters out any whose hostname ends with `.onion`, exposing clearnet sockets.
+
+15. **Proxy headers**  
+    - Checks response headers for `X-Forwarded-For`, `X-Real-IP`, `Via`, `Forwarded`.  
+    - Prints their values if present, indicating backend may reveal client IP.
+
+16. **security.txt**  
+    - GETs `/.well-known/security.txt`; on HTTP 200 prints its full contents, revealing security contacts or disclosures.
+
+17. **CAPTCHA leak**  
+    - Lowers the page text and finds all URLs containing `captcha` via `re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)')`.  
+    - Additionally searches for `/lua/cap.lua` and `/queue.html` occurrences, resolves relative paths to full URLs, and filters out `.onion` hosts — exposing external CAPTCHA services.
 
 ## Requirements
 
