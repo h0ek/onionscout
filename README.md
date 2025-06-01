@@ -132,4 +132,5 @@ pipx upgrade onionscout
 ```
 
 ## ToDo
-I am thinking about some new options.
+- Add Etag search (Shodan example: http.headers.etag:"5f6a3b7e2c1d4")
+- Remove false positives for status pages
