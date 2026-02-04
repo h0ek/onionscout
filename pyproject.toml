@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onionscout"
-version = "0.0.6"
+version = "0.0.7"
 description = "CLI tool for basic Tor hidden-service (.onion) security checks"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
   "requests[socks]>=2.25.1",
   "PySocks>=1.7.1",
