@@ -11,6 +11,7 @@ import mmh3
 import paramiko
 import uuid
 import ssl
+import base64
 from io import BytesIO
 from typing import Optional
 from PIL import Image
@@ -34,7 +35,7 @@ ASCII_LOGO = r'''
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v0.0.3
+v0.0.4
 '''
 
 console = Console()
@@ -128,22 +129,41 @@ def report_tor_check(skip: bool) -> str:
     ok = check_tor_proxy()
     return "OK (Tor SOCKS works via exit check.torproject.org)" if ok else "FAILED (may be expected for pure HS usage)"
 
-def shodan_favicon_hash(raw_content: bytes) -> int:
-    img = Image.open(BytesIO(raw_content))
-    frames = []
-    try:
-        for i in range(getattr(img, "n_frames", 1)):
-            img.seek(i)
-            frames.append(img.copy())
-    except Exception:
-        frames = [img]
-    best = max(frames, key=lambda im: (im.width or 0) * (im.height or 0))
-    try:
-        resample = Image.Resampling.LANCZOS
-    except AttributeError:
-        resample = Image.LANCZOS
-    thumb = best.resize((16, 16), resample=resample).convert("L")
-    return mmh3.hash(thumb.tobytes(), signed=False)
+def _looks_like_html(raw: bytes, ct: str) -> bool:
+    c = (ct or "").lower()
+    if "text/html" in c:
+        return True
+    s = (raw or b"")[:512].lstrip()
+    if not s:
+        return False
+    if s.startswith(b"<!doctype") or s.startswith(b"<html") or s.startswith(b"<head") or s.startswith(b"<body") or s.startswith(b"<"):
+        return True
+    if b"<html" in s.lower():
+        return True
+    return False
+
+def _favicon_content_ok(raw: bytes, ct: str) -> bool:
+    if not raw or len(raw) < 64:
+        return False
+    if _looks_like_html(raw, ct):
+        return False
+    c = (ct or "").lower()
+    if c.startswith("image/"):
+        return True
+    if "application/octet-stream" in c or "binary/octet-stream" in c:
+        return True
+    if "image/x-icon" in c or "image/vnd.microsoft.icon" in c:
+        return True
+    if not c:
+        return True
+    return False
+
+def shodan_favicon_hash_from_bytes(raw_content: bytes) -> int:
+    b64 = base64.encodebytes(raw_content)
+    return mmh3.hash(b64, signed=True)
+
+def shodan_favicon_query(h: int) -> str:
+    return f"http.favicon.hash:{h}"
 
 def detect_server(url):
     try:
@@ -198,8 +218,12 @@ def detect_favicon(url):
         if leak:
             return f"Favicon redirect leak → {leak}"
         if r and r.status_code == 200 and r.content:
-            h = shodan_favicon_hash(r.content)
-            return f"Favicon found at {ico}. Shodan hash - http.favicon.hash:{h}"
+            ct = r.headers.get("Content-Type", "") or ""
+            if not _favicon_content_ok(r.content, ct):
+                return f"Favicon at {ico} looks invalid (Content-Type={ct or 'n/a'}, len={len(r.content)})"
+            h = shodan_favicon_hash_from_bytes(r.content)
+            q = shodan_favicon_query(h)
+            return f"Favicon found at {ico}. Shodan hash: {h} | Query: {q}"
         return "No favicon at /favicon.ico"
     except Exception as e:
         return f"Error detecting favicon: {e}"
@@ -212,7 +236,7 @@ def detect_favicon_in_html(url):
             return "No favicon in HTML"
         seen = set()
         leaks = []
-        for rel, href in matches:
+        for _, href in matches:
             fav_url = urljoin(url, href)
             if fav_url in seen:
                 continue
@@ -222,11 +246,15 @@ def detect_favicon_in_html(url):
                 leaks.append(leak)
                 continue
             if rf and rf.status_code == 200 and rf.content:
-                h = shodan_favicon_hash(rf.content)
-                return f"Favicon in HTML: {fav_url}. Shodan hash - http.favicon.hash:{h}"
+                ct = rf.headers.get("Content-Type", "") or ""
+                if not _favicon_content_ok(rf.content, ct):
+                    continue
+                h = shodan_favicon_hash_from_bytes(rf.content)
+                q = shodan_favicon_query(h)
+                return f"Favicon in HTML: {fav_url}. Shodan hash: {h} | Query: {q}"
         if leaks:
             return "Favicon HTML redirect leak(s):\n" + "\n".join(sorted(set(leaks)))
-        return "No favicon in HTML"
+        return "No valid favicon in HTML"
     except Exception as e:
         return f"Unexpected error: {e}"
 
@@ -579,7 +607,7 @@ def check_etag(url):
             etag = r.headers.get("ETag") or r.headers.get("Etag")
         if etag:
             etag_clean = etag.strip().strip('"').strip("'")
-            return f'ETag: "{etag_clean}" | Shodan: http.headers.etag:"{etag_clean}"'
+            return f'ETag: "{etag_clean}" | Query: http.headers.etag:"{etag_clean}"'
         return "No ETag header"
     except Exception as e:
         return f"Error fetching ETag: {e}"
