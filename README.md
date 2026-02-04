@@ -9,91 +9,111 @@
 
 ## Checks
 
-1. **Check Tor proxy**  
-   - Calls `get("http://check.torproject.org", timeout=5)` via the shared `session` configured with `socks5h://127.0.0.1:9050`.  
-   - Uses `requests`’ retry logic (5 attempts, exponential backoff) and a 5 s override timeout.  
-   - Returns `True` if the HTML response contains `"Congratulations"` (working Tor exit).  
-   - Note: hidden services don’t need an exit; you can skip this with `--skip-tor-check`.  
+1. **SOCKS/Tor connectivity check**  
+   - Calls `get("http://check.torproject.org", timeout=5)` via `session` configured with `socks5h://127.0.0.1:9050`.  
+   - Returns pass/fail (or `Skipped (--skip-tor-check)` when disabled).
 
 2. **Detect server**  
    - `get(url)` fetches the homepage and inspects `r.headers.get("Server")`.  
    - Generates a random UUID path and requests `GET {url}/{UUID}` **with redirects disabled**.  
-   - If it returns 404, inspects the body via `re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?")` to infer server type/version from default error pages.  
+   - If it returns 404, inspects the body via `re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?")` to infer server type/version from default error pages.
+  
+3. **HTTPS/TLS sanity**
+   -  Probes `https://<onion>/` (port 443) via Tor SOCKS.
+   -  If reachable, extracts basic TLS certificate metadata (Subject, Issuer, Validity, SAN).
+   -  If not reachable, reports `HTTPS/TLS: not reachable`.
 
-3. **Detect favicon**  
+4. **Detect favicon**  
    - Requests `/favicon.ico` using **controlled redirects**: follow at most one redirect **only if** the target host ends with `.onion`; a redirect to clearnet is reported as `Favicon redirect leak → <url>`.  
    - Loads bytes into a Pillow `Image`, iterates ICO frames (`img.n_frames`), picks the largest (width×height).  
    - Resizes to 16×16 (Lanczos), converts to 8-bit grayscale (`convert("L")`), hashes with MurmurHash3 (`mmh3.hash(..., signed=False)`).  
-   - Prints a Shodan dork: `http.favicon.hash:<hash>`.  
+   - Prints a Shodan dork: `http.favicon.hash:<hash>`. Shodan note: Shodan usually indexes clearnet, not .onion. Dorks shown by onionscout are intended for cross-correlation (e.g., when the same app is exposed on clearnet or misconfigured), not for guaranteed onion indexing. Same applies for ETag header.
 
-4. **Favicon in HTML**  
+5. **Favicon in HTML**  
    - Fetches the homepage, locates `<link rel="...icon..." href="...">` via  
      `r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)'`.  
    - Resolves relative URLs and fetches using the same **controlled redirect** policy as in step 3 (clearnet redirects reported as `Favicon HTML redirect leak(s)`).  
    - Hashing identical to step 3.  
 
-5. **ETag header**  
+6. **ETag header**  
    - Attempts `HEAD` first (no redirects), then `GET` fallback.  
    - If `ETag` present, normalizes quotes and prints value plus Shodan dork: `http.headers.etag:"<value>"`.  
 
-6. **SSH fingerprint**  
+7. **SSH fingerprint**  
    - Parses hostname from `urlparse(url).hostname`.  
    - Connects via Paramiko **through Tor** by injecting a SOCKS5 socket (PySocks) with `rdns=True` (DNS for `.onion` resolved inside Tor).  
    - Obtains server key via `get_remote_server_key().get_fingerprint()`, formats as colon-separated hex and includes key type (e.g., `ssh-ed25519`).  
-   - Default port 22; override with `--ssh-port`. Connection refused simply means SSH isn’t exposed.  
+   - Default port 22; override with `--ssh-port`. Connection refused simply means SSH isn’t exposed.
+   - Uses `allow_agent=False` and `look_for_keys=False` to reduce auth noise; it only needs the host key. 
 
-7. **Comments in code**  
+8. **Comments in code**  
    - Downloads HTML; finds `<!-- … -->` blocks with `re.findall(r"<!--([\s\S]*?)-->", r.text)`.  
    - Splits each comment on newlines and trims whitespace to surface notes/tokens.  
 
-8. **Status pages**  
+9. **Status pages**  
    - Probes with redirects disabled:  
      - Apache **mod_status**: `/server-status?auto` (looks for `Total Accesses`, `ServerUptimeSeconds`, `Scoreboard`) and `/server-status` (HTML “Apache Server Status”/`Scoreboard`).  
      - Apache **mod_info**: `/server-info` (texts like “Apache Server Information”, “Server Module”).  
      - **nginx stub_status**: `/status` (plaintext pattern with `Active connections:` and `Reading:/Writing:/Waiting:`).  
      - **WebDAV**: `OPTIONS` on `/webdav` then `/`; presence of `DAV` header or `Allow` containing `PROPFIND`/`MKCOL`.  
-   - If accessible, reports `OPEN`/`protected`; scans body for IPv4 leakage with `r"\b(?:\d{1,3}\.){3}\d{1,3}\b"` and appends `; leaked IP: <ip>`.  
+   - If accessible, reports OPEN/protected; scans body for valid IPv4 leakage and appends ; `leaked IP: <ip>`.  
 
-9. **Files & paths**  
-   - Checks common sensitive files (`info.php`, `.git`, `.svn`, `.hg`, `.env`, `.DS_Store`, `security.txt`, etc.) and directories (`admin`, `backup`, `secret`).  
-   - For each entry, issues `GET {url}/{entry}` **with redirects disabled**; reports any that return HTTP 200.  
+10. **Files & paths**  
+   - Checks common sensitive files (`info.php`, `.git`, `.svn`, `.hg`, `.env`, `.DS_Store`, etc.) and directories (`admin`, `backup`, `secret`).  
+   - Uses redirects disabled; reports hits on HTTP 200.
+   - Includes a basic soft-404 filter (compares against a random baseline 404 page) to reduce false positives.
 
-10. **External resources**  
+11. **External resources**  
     - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, flags=IGNORECASE)`.  
     - Filters out URLs whose hostname ends with `.onion`, listing any clearnet dependencies (JS, CSS, images).  
 
-11. **CORS headers**  
+12. **CORS headers**  
     - After `get(url)`, iterates `r.headers.items()`, selects any keys starting with `Access-Control-`.  
     - Prints each `header: value` or “No CORS headers” if none found.  
 
-12. **Meta-refresh**  
+13. **Meta-refresh**  
     - Finds `<meta http-equiv="refresh" ...>` tags via `re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', r.text, flags=IGNORECASE)`.  
     - Extracts the `content="…url=TARGET"` portion; if `TARGET` begins with `http://` or `https://` and isn’t `.onion`, reports it as a clearnet redirect.  
 
-13. **Robots & sitemap**  
+14. **Robots & sitemap**  
     - Requests `/robots.txt` and `/sitemap.xml` using **controlled redirects**: follow one hop only if the redirect stays within `.onion`; clearnet redirects are reported as `/<file> redirect leak → <url>`.  
     - For `robots.txt`, extracts lines starting with `Disallow:` or `Sitemap:`.  
     - For `sitemap.xml`, extracts all URLs inside `<loc>…</loc>`.  
 
-14. **Form actions**  
+15. **Form actions**  
     - Searches HTML for `<form ... action="…">` with `re.findall`.  
     - Reports any actions pointing to non-`.onion` hosts (i.e., `action="http://..."`), which could leak form data.  
 
-15. **WebSocket endpoints**  
+16. **WebSocket endpoints**  
     - Uses `re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text, flags=IGNORECASE)` to detect JavaScript WS/WSS connections.  
     - Filters out any whose hostname ends with `.onion`, exposing clearnet sockets.  
 
-16. **Proxy headers**  
+17. **Proxy headers**  
     - Checks response headers for `X-Forwarded-For`, `X-Real-IP`, `Via`, `Forwarded`.  
     - Prints their values if present (may reveal upstream/client info) or “No proxy-related headers”.  
-
-17. **security.txt**  
-    - `GET /.well-known/security.txt` (redirects disabled); on HTTP 200 prints its full contents, revealing security contacts or disclosures.  
 
 18. **CAPTCHA leak**  
     - Lowers page text and finds all URLs containing `captcha` via  
       `re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, flags=IGNORECASE)`.  
-    - Additionally searches for `/lua/cap.lua` and `/queue.html`, resolves relative paths, and filters out `.onion` hosts — exposing external CAPTCHA services.  
+    - Additionally searches for `/lua/cap.lua` and `/queue.html`, resolves relative paths, and filters out `.onion` hosts — exposing external CAPTCHA services.
+
+19. **Onion-Location header**
+    - Reports `Onion-Location` header if present.
+   
+20. **Header leaks**
+    - Highlights common fingerprinting/leak headers (e.g., `Server`, `X-Powered-By`, `X-Generator`, etc.).
+   
+21. **Well-known endpoints**
+    - Probes common `/.well-known/*` endpoints and reports those returning HTTP 200.
+   
+22. **Protocol-relative links**
+    - Detects `src/href="//..."` dependencies and reports non-`.onion` hosts.
+
+23. **security.txt (root)**
+    - `GET /security.txt` (redirects disabled); prints contents on HTTP 200.
+
+24. **security.txt (.well-known)**
+    - `GET /.well-known/security.txt` (redirects disabled); prints contents on HTTP 200.
 
 ## Requirements
 - Python 3.8+  
@@ -183,3 +203,7 @@ pipx upgrade onionscout
 ## ToDo
 - [x] Add Etag search (Shodan example: http.headers.etag:"5f6a3b7e2c1d4")
 - [x] Remove false positives for status pages
+- [x] Reduce false positives for file/path hits (soft-404 baseline)
+- [x] Add HTTPS/TLS sanity check
+- [x] Add Onion-Location + header leak checks
+- [x] Add .well-known enumeration + protocol-relative dependency detection
