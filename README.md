@@ -109,14 +109,38 @@
    - Detects `src/href="//..."` dependencies and reports non-`.onion` hosts.
 
 23. **security.txt (root)**
-   - `GET /security.txt` (redirects disabled); prints contents on HTTP 200.
+   - Requests `/security.txt` using **controlled redirects** (clearnet redirect is reported as a leak).
+   - Validates if the response looks like a real `security.txt` (directive-based).
+   - If it returns HTML/index/soft404, reports: `HTTP 200 but NOT valid security.txt`.
 
 24. **security.txt (.well-known)**
-   - `GET /.well-known/security.txt` (redirects disabled); prints contents on HTTP 200.
+   - Requests `/.well-known/security.txt` using **controlled redirects** (clearnet redirect is reported as a leak).
+   - Validates if the response looks like a real `security.txt` (directive-based).
+   - If it returns HTML/index/soft404, reports: `HTTP 200 but NOT valid security.txt`.
+
+25. **Crawl links**
+   - Minimal crawler to collect more internal URLs from the target hidden service.
+   - Scope:
+     - max 80 URLs
+     - depth 1
+     - same `.onion` host only
+   - Parses: `<a href>`, `<link href>`, `<img src>`, `<script src>`
+   - Skips common static assets by extension (images/fonts/archives/etc.)
+   - Tries to ignore catch-all 200/index/soft404 pages using:
+     - soft404 baseline
+     - homepage HTML fingerprint (hash)
+
+26. **Indicators (emails/crypto)**
+   - Extracts useful “signals” from crawled HTML pages:
+     - Emails
+     - BTC addresses
+     - ETH addresses
+     - XMR addresses (simplified regex indicator)
+   - Printed as grouped output in the final report.
 
 ## Requirements
-- Python 3.8+  
-- Tor listening on `127.0.0.1:9050`; Tor Browser uses 9150 by default (use --socks 127.0.0.1:9150).”
+- Python 3.10+  
+- Tor listening on `127.0.0.1:9050`; Tor Browser uses 9150 by default (use --socks 127.0.0.1:9150); or from Whonix Gateway 10.152.152.10:9050
 - **pipx** (recommended)
 
 ## Installation via pipx
@@ -148,6 +172,9 @@ onionscout -u <ONION_URL> --skip-tor-check --socks 127.0.0.1:9050
 
 # Using Tor Browser SOCKS (usually 9150)
 onionscout -u <ONION_URL> --skip-tor-check --socks 127.0.0.1:9150
+
+# Using Whonix Gateway SOCKS (example)
+onionscout -u <ONION_URL> --skip-tor-check --socks 10.152.152.10:9050
 
 # Increase HTTP timeout and slow down between checks
 onionscout -u <ONION_URL> -t 20 -s 5
@@ -215,3 +242,5 @@ pipx upgrade onionscout
 - [x] Add Onion-Location + header leak checks
 - [x] Add .well-known enumeration + protocol-relative dependency detection
 - [x] Add report export to file (-o/--output)
+- [x] Add minimal crawler (same host, depth-limited)
+- [x] Add indicators extraction (emails + crypto addresses)
