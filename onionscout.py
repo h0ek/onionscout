@@ -33,7 +33,7 @@ ASCII_LOGO = r'''
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v0.0.6
+v0.0.7
 '''
 
 console = Console()
@@ -205,10 +205,188 @@ def get_onion_follow(url, **kwargs):
             return None, nxt
     return r, None
 
+EMAIL_RE = re.compile(r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', re.IGNORECASE)
+
+# BTC: legacy + bech32
+BTC_RE = re.compile(r'\b(?:bc1[ac-hj-np-z02-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b')
+
+# ETH
+ETH_RE = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
+
+# XMR (uproszczone – wystarczy jako “indicator”)
+XMR_RE = re.compile(r'\b[48][0-9AB][1-9A-HJ-NP-Za-km-z]{90,105}\b')
+
+def extract_indicators_from_text(text: str) -> dict:
+    t = text or ""
+    return {
+        "emails": sorted(set(EMAIL_RE.findall(t))),
+        "btc": sorted(set(BTC_RE.findall(t))),
+        "eth": sorted(set(ETH_RE.findall(t))),
+        "xmr": sorted(set(XMR_RE.findall(t))),
+    }
+
+def indicators_from_urls(urls: list[str]) -> str:
+    agg = {"emails": set(), "btc": set(), "eth": set(), "xmr": set()}
+
+    for u in urls:
+        try:
+            r, leak = get_onion_follow(u)
+            if leak or not r or r.status_code != 200:
+                continue
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            if "html" not in ct:
+                continue
+            ind = extract_indicators_from_text(r.text or "")
+            for k in agg:
+                agg[k].update(ind[k])
+        except Exception:
+            continue
+
+    lines = []
+    for k, label in [("emails","Emails"),("btc","BTC"),("eth","ETH"),("xmr","XMR")]:
+        vals = sorted(agg[k])
+        if vals:
+            lines.append(f"{label}:\n" + "\n".join(vals[:30]) + (f"\n… (+{len(vals)-30})" if len(vals) > 30 else ""))
+        else:
+            lines.append(f"{label}: none")
+    return "\n\n".join(lines)
+
 ICON_LINK_RE = re.compile(
     r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)["\']',
     re.IGNORECASE
 )
+
+from collections import deque
+import hashlib
+
+ASSET_EXT_SKIP = re.compile(r'\.(?:png|jpe?g|gif|webp|svg|ico|mp4|mp3|wav|woff2?|ttf|eot|pdf|zip|rar|7z)$', re.IGNORECASE)
+
+TAG_ATTR_RE = re.compile(
+    r'''<(a|link)\b[^>]*(?:href)=["']([^"']+)["']|<(img|script)\b[^>]*(?:src)=["']([^"']+)["']''',
+    re.IGNORECASE
+)
+
+def _norm_url(base_url: str, u: str) -> Optional[str]:
+    if not u:
+        return None
+    u = u.strip()
+    if u.startswith(("mailto:", "javascript:", "data:", "tel:")):
+        return None
+    full = urljoin(base_url, u)
+    pu = urlparse(full)
+    if pu.scheme not in ("http", "https"):
+        return None
+    # wywal fragmenty
+    full = full.split("#", 1)[0]
+    return full
+
+def _same_onion_host(base_url: str, full_url: str) -> bool:
+    b = urlparse(base_url).hostname or ""
+    h = urlparse(full_url).hostname or ""
+    return b.lower() == h.lower()
+
+def _hash_html(text: str) -> str:
+    # normalizacja lekka, żeby drobne różnice mniej przeszkadzały
+    t = (text or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return hashlib.sha256(t.encode("utf-8", errors="ignore")).hexdigest()
+
+def _get_home_fingerprint(base_url: str) -> Optional[str]:
+    try:
+        r, leak = get_onion_follow(base_url + "/")
+        if leak or not r or r.status_code != 200:
+            return None
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if "html" not in ct:
+            return None
+        return _hash_html(r.text or "")
+    except Exception:
+        return None
+
+def _looks_like_index_redirect_or_soft404(r, soft404_baseline, home_fp: Optional[str]) -> bool:
+    if not r:
+        return True
+    # jeśli wygląda jak soft404 (Twoja funkcja)
+    if looks_like_soft404(r, soft404_baseline):
+        return True
+    # jeśli 200 i HTML identyczny jak home -> traktuj jak “redirect to index”
+    try:
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if r.status_code == 200 and "html" in ct and home_fp:
+            fp = _hash_html(r.text or "")
+            if fp == home_fp:
+                return True
+    except Exception:
+        pass
+    return False
+
+def crawl_links(base_url: str, max_urls: int = 80, depth: int = 1) -> list[str]:
+    base = base_url.rstrip("/")
+    home_fp = _get_home_fingerprint(base)
+    soft404_baseline = get_soft404_baseline(base)
+
+    start_urls = [base + "/"]
+    # opcjonalnie: dorzuć robots/sitemap jako “seed” (bez bruteforce)
+    start_urls += [base + "/robots.txt", base + "/sitemap.xml"]
+
+    q = deque()
+    seen = set()
+    out = []
+
+    for u in start_urls:
+        q.append((u, 0))
+
+    while q and len(out) < max_urls:
+        url, d = q.popleft()
+        if url in seen:
+            continue
+        seen.add(url)
+
+        # filtr hosta
+        if not _same_onion_host(base, url):
+            continue
+
+        # szybki filtr assetów
+        if ASSET_EXT_SKIP.search(urlparse(url).path or ""):
+            continue
+
+        try:
+            r, leak = get_onion_follow(url)
+            if leak:
+                # tu możesz ewentualnie logować leak jako “znaleziony przez crawl”
+                continue
+            if not r:
+                continue
+
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            # crawlujemy tylko HTML
+            if r.status_code != 200 or "html" not in ct:
+                continue
+
+            # omijamy “wszystko to index”
+            if _looks_like_index_redirect_or_soft404(r, soft404_baseline, home_fp):
+                continue
+
+            out.append(url)
+
+            if d >= depth:
+                continue
+
+            html = r.text or ""
+            for m in TAG_ATTR_RE.finditer(html):
+                href = m.group(2) or m.group(4)
+                full = _norm_url(base, href)
+                if not full:
+                    continue
+                if not _same_onion_host(base, full):
+                    continue
+                if full not in seen:
+                    q.append((full, d + 1))
+
+        except Exception:
+            continue
+
+    return out
 
 def detect_favicon(url):
     ico = f"{url.rstrip('/')}/favicon.ico"
@@ -854,6 +1032,7 @@ def main():
         show_help()
         sys.exit(1)
     base_url = f"{p.scheme}://{p.netloc}"
+    crawled_urls = crawl_links(base_url, max_urls=80, depth=1)
 
     if not args.json:
         console.print(ASCII_LOGO)
@@ -891,6 +1070,8 @@ def main():
         ("security.txt (.well-known)", lambda: check_security_txt(base_url)),
 
         ("CAPTCHA leak", lambda: check_captcha_leak(base_url)),
+        ("Crawl links", lambda: f"Collected {len(crawled_urls)} URLs (depth=1, max=80)"),
+        ("Indicators (emails/crypto)", lambda: indicators_from_urls(crawled_urls)),
     ]
 
     total = len(tasks)
