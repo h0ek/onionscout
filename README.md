@@ -116,7 +116,7 @@
 
 ## Requirements
 - Python 3.8+  
-- Tor listening on `127.0.0.1:9050`
+- Tor listening on `127.0.0.1:9050`; Tor Browser uses 9150 by default (use --socks 127.0.0.1:9150).”
 - **pipx** (recommended)
 
 ## Installation via pipx
@@ -155,8 +155,11 @@ onionscout -u <ONION_URL> -t 20 -s 5
 # Specify custom SSH port for fingerprinting
 onionscout -u <ONION_URL> --ssh-port 2222
 
-# Machine-readable output
-onionscout -u <ONION_URL> --json
+# Save report to a file (TXT by default)
+onionscout -u <ONION_URL> -o report.txt
+
+# Save machine-readable JSON to a file
+onionscout -u <ONION_URL> --json -o report.json
 ```
 
 ## Command-line Options
@@ -189,6 +192,11 @@ The script accepts the following parameters:
 `--json`  
 **Optional.** Print the final report as JSON (useful for automation).
 
+`-o, --output <path>`
+**Optional.** Write the final report to a file.
+   - If `--json` is set → writes JSON
+   - Otherwise → writes a TXT report (human-readable)
+
 ## Uninstall
 ```bash
 pipx uninstall onionscout
@@ -206,3 +214,4 @@ pipx upgrade onionscout
 - [x] Add HTTPS/TLS sanity check
 - [x] Add Onion-Location + header leak checks
 - [x] Add .well-known enumeration + protocol-relative dependency detection
+- [x] Add report export to file (-o/--output)
