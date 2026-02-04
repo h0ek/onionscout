@@ -12,9 +12,7 @@ import paramiko
 import uuid
 import ssl
 import base64
-from io import BytesIO
 from typing import Optional
-from PIL import Image
 from urllib.parse import urlparse, urljoin
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -35,7 +33,7 @@ ASCII_LOGO = r'''
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v0.0.5
+v0.0.6
 '''
 
 console = Console()
@@ -521,10 +519,17 @@ def check_robots_sitemap(url):
         r, leak = get_onion_follow(f"{base}/robots.txt")
         if leak:
             out.append(f"/robots.txt redirect leak → {leak}")
-        elif r and r.status_code == 200 and r.text:
-            lines = [l for l in r.text.splitlines() if l.lower().startswith(("disallow:", "sitemap:"))]
-            if lines:
-                out.append("/robots.txt entries:\n" + "\n".join(lines))
+        elif r and r.status_code == 200 and (r.content or b""):
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            if _looks_like_html(r.content or b"", ct):
+                # 200 ale to HTML/index/soft404 -> ignoruj
+                pass
+            else:
+                text = (r.text or "")
+                lines = [l for l in text.splitlines()
+                         if l.lower().startswith(("disallow:", "sitemap:"))]
+                if lines:
+                    out.append("/robots.txt entries:\n" + "\n".join(lines))
     except RequestException:
         pass
 
@@ -532,14 +537,21 @@ def check_robots_sitemap(url):
         r, leak = get_onion_follow(f"{base}/sitemap.xml")
         if leak:
             out.append(f"/sitemap.xml redirect leak → {leak}")
-        elif r and r.status_code == 200 and r.text:
-            locs = re.findall(r"<loc>([^<]+)</loc>", r.text, re.IGNORECASE)
-            if locs:
-                out.append("/sitemap.xml locs:\n" + "\n".join(locs))
+        elif r and r.status_code == 200 and (r.content or b""):
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            if _looks_like_html(r.content or b"", ct):
+                # 200 ale to HTML/index/soft404 -> ignoruj
+                pass
+            else:
+                text = (r.text or "")
+                locs = re.findall(r"<loc>([^<]+)</loc>", text, re.IGNORECASE)
+                if locs:
+                    out.append("/sitemap.xml locs:\n" + "\n".join(locs))
     except RequestException:
         pass
 
     return "\n\n".join(out) if out else "No robots.txt or sitemap.xml entries found"
+
 
 def check_form_actions(url):
     try:
@@ -568,19 +580,100 @@ def check_proxy_headers(url):
     except Exception as e:
         return f"Error fetching proxy headers: {e}"
 
-def check_security_txt(url):
+SECURITYTXT_MAX_BYTES = 200_000  # sanity limit
+
+# Minimalnie sensowne dyrektywy wg spec (wystarczy do odróżniania od HTML/index)
+SECURITYTXT_DIRECTIVE_RE = re.compile(
+    r'^(Contact|Expires|Encryption|Acknowledgments|Policy|Hiring|Preferred-Languages|Canonical)\s*:\s*.+$',
+    re.IGNORECASE
+)
+
+def _first_nonempty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s
+    return ""
+
+def _looks_like_security_txt(body_text: str) -> bool:
+    # security.txt to tekst z dyrektywami "Hint: Contact:, Expires:, ..."
+    first = _first_nonempty_line(body_text)
+    if not first:
+        return False
+    return bool(SECURITYTXT_DIRECTIVE_RE.match(first))
+
+def _securitytxt_invalid_reason(r) -> Optional[str]:
+    # r: requests.Response
+    if not r:
+        return "no response"
+    ct = (r.headers.get("Content-Type", "") or "").lower()
+    raw = r.content or b""
+
+    if len(raw) == 0:
+        return "empty body"
+    if len(raw) > SECURITYTXT_MAX_BYTES:
+        return f"too large ({len(raw)} bytes)"
+
+    # Jeśli wygląda jak HTML -> to nie security.txt (najczęstszy błąd)
+    if _looks_like_html(raw, ct):
+        return f"looks like HTML (Content-Type={ct or 'n/a'})"
+
+    # Jeśli content-type mówi "json/xml/image" itp. raczej nie security.txt
+    # (text/plain, text/*, albo brak -> OK)
+    if ct and not (ct.startswith("text/") or "text" in ct or "charset=" in ct):
+        # nie blokuj agresywnie, ale oznacz jako podejrzane
+        # (wiele serwerów daje application/octet-stream)
+        if "octet-stream" not in ct:
+            return f"suspicious Content-Type ({ct})"
+
+    text = (r.text or "").strip()
+    if not _looks_like_security_txt(text):
+        # to klucz: 200 + "jakiś tekst" nadal może być index/soft404
+        return "does not look like security.txt directives"
+
+    return None
+
+def _fetch_security_txt(base_url: str, path: str) -> str:
+    base = base_url.rstrip("/")
+    full = f"{base}{path}"
+
     try:
-        r = get(f"{url.rstrip('/')}/.well-known/security.txt", allow_redirects=False)
-        return "security.txt (.well-known):\n" + r.text.strip() if r.status_code == 200 and r.text else "security.txt (.well-known) not found"
+        r, leak = get_onion_follow(full)
+        if leak:
+            return f"{path}: redirect leak → {leak}"
+
+        if not r:
+            return f"{path}: no response"
+
+        if r.status_code != 200:
+            return f"{path}: not found (HTTP {r.status_code})"
+
+        reason = _securitytxt_invalid_reason(r)
+        if reason:
+            ct = (r.headers.get("Content-Type", "") or "")
+            sample = (r.text or "")[:120].replace("\n", " ").strip()
+            return f"{path}: HTTP 200 but NOT valid security.txt ({reason}); Content-Type={ct or 'n/a'}; sample='{sample}'"
+
+        # OK – preview sensownych linii (bez komentarzy)
+        lines = []
+        for line in (r.text or "").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            lines.append(s)
+            if len(lines) >= 12:
+                break
+        preview = "\n".join(lines)
+        return f"{path}: VALID\n{preview}"
+
     except Exception as e:
-        return f"Error fetching security.txt (.well-known): {e}"
+        return f"{path}: error ({e})"
 
 def check_security_txt_root(url):
-    try:
-        r = get(f"{url.rstrip('/')}/security.txt", allow_redirects=False)
-        return "security.txt (root):\n" + r.text.strip() if r.status_code == 200 and r.text else "security.txt (root) not found"
-    except Exception as e:
-        return f"Error fetching security.txt (root): {e}"
+    return _fetch_security_txt(url, "/security.txt")
+
+def check_security_txt(url):
+    return _fetch_security_txt(url, "/.well-known/security.txt")
 
 def check_captcha_leak(url):
     try:
@@ -667,10 +760,16 @@ def check_well_known(url: str) -> str:
     hits = []
     for pth in WELL_KNOWN_PATHS:
         try:
-            r = get(f"{base}{pth}", allow_redirects=False)
-            if r.status_code == 200:
+            r, leak = get_onion_follow(f"{base}{pth}")
+            if leak:
+                hits.append(f"{pth} -> redirect leak → {leak}")
+                continue
+            if r and r.status_code == 200:
                 ct = (r.headers.get("Content-Type", "") or "").lower()
-                hits.append(f"{pth} -> 200 ({ct or 'n/a'})")
+                if _looks_like_html(r.content or b"", ct):
+                    hits.append(f"{pth} -> 200 but looks like HTML (ct={ct or 'n/a'})")
+                else:
+                    hits.append(f"{pth} -> 200 ({ct or 'n/a'})")
         except Exception:
             continue
     return "Well-known endpoints:\n" + "\n".join(hits) if hits else "No .well-known endpoints found"
