@@ -13,12 +13,16 @@
    - Calls `get("http://check.torproject.org", timeout=5)` via `session` configured with `socks5h://127.0.0.1:9050`.  
    - Returns pass/fail (or `Skipped (--skip-tor-check)` when disabled).
 
-2. **Detect server**  
+2. **Cookie provided (optional)**
+   - If `--cookie` is set, sends it as a raw `Cookie:` header with all requests.
+   - Report shows `YES (N chars)` or `NO`.
+
+3. **Detect server**  
    - `get(url)` fetches the homepage and inspects `r.headers.get("Server")`.  
    - Generates a random UUID path and requests `GET {url}/{UUID}` **with redirects disabled**.  
    - If it returns 404, inspects the body via `re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?")` to infer server type/version from default error pages.
   
-3. **HTTPS/TLS sanity**
+4. **HTTPS/TLS sanity**
    -  Probes `https://<onion>/` (port 443) via Tor SOCKS.
    -  If reachable, extracts basic TLS certificate metadata (Subject, Issuer, Validity, SAN).
    -  If not reachable, reports `HTTPS/TLS: not reachable`.
@@ -140,7 +144,7 @@
 
 ## Requirements
 - Python 3.10+  
-- Tor listening on `127.0.0.1:9050`; Tor Browser uses 9150 by default (use --socks 127.0.0.1:9150); or from Whonix Gateway 10.152.152.10:9050
+- Tor SOCKS5h available at `127.0.0.1:9050` (Tor daemon) or `127.0.0.1:9150` (Tor Browser) or `10.152.152.10:9050` (Whonix Gateway)
 - **pipx** (recommended)
 
 ## Installation via pipx
@@ -161,6 +165,11 @@ Show help
 onionscout
 ```
 
+Usage
+```bash
+onionscout [-t TIMEOUT] [-s SLEEP] [--socks HOST:PORT] [--ssh-port PORT] [--cookie COOKIE] [--skip-tor-check] [--json] [-o OUTPUT] -u URL
+```
+
 Run a scan
 ```bash
 onionscout -u <ONION_URL>
@@ -175,6 +184,9 @@ onionscout -u <ONION_URL> --skip-tor-check --socks 127.0.0.1:9150
 
 # Using Whonix Gateway SOCKS (example)
 onionscout -u <ONION_URL> --skip-tor-check --socks 10.152.152.10:9050
+
+# Provide cookies (raw Cookie header) for sites with simple access-gates
+onionscout -u <ONION_URL> --cookie 'session=Q75ibZ5SIyqshx5jtFUK8v%2BPM6%2FGORzcTpGgZ%2BB34swS; access=bdda413a3cee5def4ceb53adbfa57068'
 
 # Increase HTTP timeout and slow down between checks
 onionscout -u <ONION_URL> -t 20 -s 5
@@ -215,6 +227,11 @@ The script accepts the following parameters:
 
 `--skip-tor-check`  
 **Optional.** Skip calling `check.torproject.org`.  
+
+`--cookie <COOKIE>`
+**Optional.** Raw `Cookie` header value sent with all HTTP(S) requests.  
+Use it when a hidden service requires a simple access cookie to view content.  
+**Example:** `--cookie 'access=...; session=...'`
 
 `--json`  
 **Optional.** Print the final report as JSON (useful for automation).
