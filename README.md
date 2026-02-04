@@ -31,7 +31,7 @@
 
 5. **Favicon in HTML**  
    - Fetches the homepage, locates `<link rel="...icon..." href="...">` via  
-     `r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)'`.  
+        `r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)'`.  
    - Resolves relative URLs and fetches using the same **controlled redirect** policy as in step 3 (clearnet redirects reported as `Favicon HTML redirect leak(s)`).  
    - Hashing identical to step 3.  
 
@@ -52,10 +52,10 @@
 
 9. **Status pages**  
    - Probes with redirects disabled:  
-     - Apache **mod_status**: `/server-status?auto` (looks for `Total Accesses`, `ServerUptimeSeconds`, `Scoreboard`) and `/server-status` (HTML “Apache Server Status”/`Scoreboard`).  
-     - Apache **mod_info**: `/server-info` (texts like “Apache Server Information”, “Server Module”).  
-     - **nginx stub_status**: `/status` (plaintext pattern with `Active connections:` and `Reading:/Writing:/Waiting:`).  
-     - **WebDAV**: `OPTIONS` on `/webdav` then `/`; presence of `DAV` header or `Allow` containing `PROPFIND`/`MKCOL`.  
+      - Apache **mod_status**: `/server-status?auto` (looks for `Total Accesses`, `ServerUptimeSeconds`, `Scoreboard`) and `/server-status` (HTML “Apache Server Status”/`Scoreboard`).  
+      - Apache **mod_info**: `/server-info` (texts like “Apache Server Information”, “Server Module”).  
+      - **nginx stub_status**: `/status` (plaintext pattern with `Active connections:` and `Reading:/Writing:/Waiting:`).  
+      - **WebDAV**: `OPTIONS` on `/webdav` then `/`; presence of `DAV` header or `Allow` containing `PROPFIND`/`MKCOL`.  
    - If accessible, reports OPEN/protected; scans body for valid IPv4 leakage and appends ; `leaked IP: <ip>`.  
 
 10. **Files & paths**  
@@ -64,56 +64,56 @@
    - Includes a basic soft-404 filter (compares against a random baseline 404 page) to reduce false positives.
 
 11. **External resources**  
-    - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, flags=IGNORECASE)`.  
-    - Filters out URLs whose hostname ends with `.onion`, listing any clearnet dependencies (JS, CSS, images).  
+   - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, flags=IGNORECASE)`.  
+   - Filters out URLs whose hostname ends with `.onion`, listing any clearnet dependencies (JS, CSS, images).  
 
 12. **CORS headers**  
-    - After `get(url)`, iterates `r.headers.items()`, selects any keys starting with `Access-Control-`.  
-    - Prints each `header: value` or “No CORS headers” if none found.  
+   - After `get(url)`, iterates `r.headers.items()`, selects any keys starting with `Access-Control-`.  
+   - Prints each `header: value` or “No CORS headers” if none found.  
 
 13. **Meta-refresh**  
-    - Finds `<meta http-equiv="refresh" ...>` tags via `re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', r.text, flags=IGNORECASE)`.  
-    - Extracts the `content="…url=TARGET"` portion; if `TARGET` begins with `http://` or `https://` and isn’t `.onion`, reports it as a clearnet redirect.  
+   - Finds `<meta http-equiv="refresh" ...>` tags via `re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', r.text, flags=IGNORECASE)`.  
+   - Extracts the `content="…url=TARGET"` portion; if `TARGET` begins with `http://` or `https://` and isn’t `.onion`, reports it as a clearnet redirect.  
 
 14. **Robots & sitemap**  
-    - Requests `/robots.txt` and `/sitemap.xml` using **controlled redirects**: follow one hop only if the redirect stays within `.onion`; clearnet redirects are reported as `/<file> redirect leak → <url>`.  
-    - For `robots.txt`, extracts lines starting with `Disallow:` or `Sitemap:`.  
-    - For `sitemap.xml`, extracts all URLs inside `<loc>…</loc>`.  
+   - Requests `/robots.txt` and `/sitemap.xml` using **controlled redirects**: follow one hop only if the redirect stays within `.onion`; clearnet redirects are reported as `/<file> redirect leak → <url>`.  
+   - For `robots.txt`, extracts lines starting with `Disallow:` or `Sitemap:`.  
+   - For `sitemap.xml`, extracts all URLs inside `<loc>…</loc>`.  
 
 15. **Form actions**  
-    - Searches HTML for `<form ... action="…">` with `re.findall`.  
-    - Reports any actions pointing to non-`.onion` hosts (i.e., `action="http://..."`), which could leak form data.  
+   - Searches HTML for `<form ... action="…">` with `re.findall`.  
+   - Reports any actions pointing to non-`.onion` hosts (i.e., `action="http://..."`), which could leak form data.  
 
 16. **WebSocket endpoints**  
-    - Uses `re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text, flags=IGNORECASE)` to detect JavaScript WS/WSS connections.  
-    - Filters out any whose hostname ends with `.onion`, exposing clearnet sockets.  
+   - Uses `re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text, flags=IGNORECASE)` to detect JavaScript WS/WSS connections.  
+   - Filters out any whose hostname ends with `.onion`, exposing clearnet sockets.  
 
 17. **Proxy headers**  
-    - Checks response headers for `X-Forwarded-For`, `X-Real-IP`, `Via`, `Forwarded`.  
-    - Prints their values if present (may reveal upstream/client info) or “No proxy-related headers”.  
+   - Checks response headers for `X-Forwarded-For`, `X-Real-IP`, `Via`, `Forwarded`.  
+   - Prints their values if present (may reveal upstream/client info) or “No proxy-related headers”.  
 
 18. **CAPTCHA leak**  
-    - Lowers page text and finds all URLs containing `captcha` via  
+   - Lowers page text and finds all URLs containing `captcha` via  
       `re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, flags=IGNORECASE)`.  
-    - Additionally searches for `/lua/cap.lua` and `/queue.html`, resolves relative paths, and filters out `.onion` hosts — exposing external CAPTCHA services.
+   - Additionally searches for `/lua/cap.lua` and `/queue.html`, resolves relative paths, and filters out `.onion` hosts — exposing external CAPTCHA services.
 
 19. **Onion-Location header**
-    - Reports `Onion-Location` header if present.
+   - Reports `Onion-Location` header if present.
    
 20. **Header leaks**
-    - Highlights common fingerprinting/leak headers (e.g., `Server`, `X-Powered-By`, `X-Generator`, etc.).
+   - Highlights common fingerprinting/leak headers (e.g., `Server`, `X-Powered-By`, `X-Generator`, etc.).
    
 21. **Well-known endpoints**
-    - Probes common `/.well-known/*` endpoints and reports those returning HTTP 200.
+   - Probes common `/.well-known/*` endpoints and reports those returning HTTP 200.
    
 22. **Protocol-relative links**
-    - Detects `src/href="//..."` dependencies and reports non-`.onion` hosts.
+   - Detects `src/href="//..."` dependencies and reports non-`.onion` hosts.
 
 23. **security.txt (root)**
-    - `GET /security.txt` (redirects disabled); prints contents on HTTP 200.
+   - `GET /security.txt` (redirects disabled); prints contents on HTTP 200.
 
 24. **security.txt (.well-known)**
-    - `GET /.well-known/security.txt` (redirects disabled); prints contents on HTTP 200.
+   - `GET /.well-known/security.txt` (redirects disabled); prints contents on HTTP 200.
 
 ## Requirements
 - Python 3.8+  
