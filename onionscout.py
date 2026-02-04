@@ -33,7 +33,7 @@ ASCII_LOGO = r'''
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v0.0.7
+v0.0.8
 '''
 
 console = Console()
@@ -65,6 +65,10 @@ def configure_tor_proxy(host: str, port: int):
     proxy = f"socks5h://{host}:{port}"
     session.proxies = {"http": proxy, "https": proxy}
 
+def set_cookie_header(cookie_str: str):
+    # Ustawiamy surowy header Cookie (najbardziej przewidywalne dla wielu ciastek naraz)
+    session.headers["Cookie"] = cookie_str.strip()
+
 def get(url, **kwargs):
     timeout = kwargs.pop("timeout", cfg.timeout)
     return session.get(url, timeout=timeout, **kwargs)
@@ -84,7 +88,7 @@ def show_help():
 def print_help_body():
     console.print("Lightweight CLI for basic Tor hidden-service (.onion) security checks\n")
     console.print("usage:")
-    console.print("  onionscout [-t TIMEOUT] [-s SLEEP] [--socks HOST:PORT] [--skip-tor-check] [--json] [-o OUTPUT] -u URL\n")
+    console.print("  onionscout [-t TIMEOUT] [-s SLEEP] [--socks HOST:PORT] [--skip-tor-check] [--json] [--cookie COOKIE] [-o OUTPUT] -u URL\n")
     console.print("options:")
     console.print("  -t TIMEOUT           HTTP timeout in seconds (default: 10.0)")
     console.print("  -s SLEEP             seconds between checks (default: 3.0)")
@@ -92,6 +96,7 @@ def print_help_body():
     console.print("  --ssh-port PORT      SSH port for fingerprint check (default: 22)")
     console.print("  --skip-tor-check     do not call check.torproject.org")
     console.print("  --json               output JSON instead of a table")
+    console.print("  --cookie COOKIE      raw Cookie header, e.g. 'a=b; c=d'")
     console.print("  -o OUTPUT            write report to file (JSON if --json, else TXT)")
     console.print("  -u URL               .onion URL to scan (e.g. abcdef.onion)")
 
@@ -1011,6 +1016,7 @@ def main():
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument("--skip-tor-check", action="store_true", help="Do not call check.torproject.org")
     parser.add_argument("--json", action="store_true", help="Output JSON report")
+    parser.add_argument("--cookie", help='Raw Cookie header value, e.g. \'a=b; c=d\'')
     parser.add_argument("-o", "--output", help="Write report to file (JSON if --json, else TXT)")
     parser.add_argument("-u", "--url", required=True, help=".onion URL to scan (e.g. abcdef.onion)")
     args = parser.parse_args()
@@ -1021,6 +1027,9 @@ def main():
     cfg.socks_host, cfg.socks_port = socks_host, socks_port
     configure_tor_proxy(socks_host, socks_port)
 
+    if args.cookie:
+        set_cookie_header(args.cookie)
+    
     raw = args.url.strip()
     if not raw.startswith(("http://", "https://")):
         raw = "http://" + raw
@@ -1039,6 +1048,7 @@ def main():
 
     tasks = [
         ("SOCKS/Tor connectivity check", lambda: report_tor_check(args.skip_tor_check)),
+        ("Cookie provided", lambda: f"YES ({len(args.cookie)} chars)" if args.cookie else "NO"),
         ("Detect server", lambda: detect_server(base_url)),
         ("HTTPS/TLS sanity", lambda: check_https_tls(base_url)),
 
