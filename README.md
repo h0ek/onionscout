@@ -23,18 +23,17 @@
    -  If reachable, extracts basic TLS certificate metadata (Subject, Issuer, Validity, SAN).
    -  If not reachable, reports `HTTPS/TLS: not reachable`.
 
-4. **Detect favicon**  
-   - Requests `/favicon.ico` using **controlled redirects**: follow at most one redirect **only if** the target host ends with `.onion`; a redirect to clearnet is reported as `Favicon redirect leak → <url>`.  
-   - Loads bytes into a Pillow `Image`, iterates ICO frames (`img.n_frames`), picks the largest (width×height).  
-   - Resizes to 16×16 (Lanczos), converts to 8-bit grayscale (`convert("L")`), hashes with MurmurHash3 (`mmh3.hash(..., signed=False)`).  
-   - Prints a Shodan dork: `http.favicon.hash:<hash>`. Shodan note: Shodan usually indexes clearnet, not .onion. Dorks shown by onionscout are intended for cross-correlation (e.g., when the same app is exposed on clearnet or misconfigured), not for guaranteed onion indexing. Same applies for ETag header.
-
+4. **Detect favicon**
+   - Requests `/favicon.ico` using **controlled redirects**: follow at most one redirect **only if** the target host ends with `.onion`; a redirect to clearnet is reported as `Favicon redirect leak → <url>`.
+   - Computes Shodan-compatible MurmurHash3 over the favicon bytes (same approach as Shodan/favscan conceptually: hash of the favicon “data”).
+   - Prints a ready Shodan dork: `http.favicon.hash:<hash>`.
+     
 5. **Favicon in HTML**  
    - Fetches the homepage, locates `<link rel="...icon..." href="...">` via  
         `r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)'`.  
    - Resolves relative URLs and fetches using the same **controlled redirect** policy as in step 3 (clearnet redirects reported as `Favicon HTML redirect leak(s)`).  
-   - Hashing identical to step 3.  
-
+   - Hashing identical to step 4 and prints `http.favicon.hash:<hash>` (Shodan dork).
+ 
 6. **ETag header**  
    - Attempts `HEAD` first (no redirects), then `GET` fallback.  
    - If `ETag` present, normalizes quotes and prints value plus Shodan dork: `http.headers.etag:"<value>"`.  
@@ -58,10 +57,10 @@
       - **WebDAV**: `OPTIONS` on `/webdav` then `/`; presence of `DAV` header or `Allow` containing `PROPFIND`/`MKCOL`.  
    - If accessible, reports OPEN/protected; scans body for valid IPv4 leakage and appends ; `leaked IP: <ip>`.  
 
-10. **Files & paths**  
-   - Checks common sensitive files (`info.php`, `.git`, `.svn`, `.hg`, `.env`, `.DS_Store`, etc.) and directories (`admin`, `backup`, `secret`).  
-   - Uses redirects disabled; reports hits on HTTP 200.
-   - Includes a basic soft-404 filter (compares against a random baseline 404 page) to reduce false positives.
+10. **Files & paths**
+   - Checks common sensitive files (`info.php`, `.git`, `.svn`, `.hg`, `.env`, `.DS_Store`, etc.) and directories (`admin`, `backup`, `secret`).
+   - Uses redirects disabled.
+   - Includes a **soft-404 / catch-all 200 filter**: it first fetches a random non-existent path as a baseline, then skips results that look like the same “default page/index” response (reduces false positives when the server returns 200 for everything).
 
 11. **External resources**  
    - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, flags=IGNORECASE)`.  
