@@ -10,7 +10,9 @@ import requests
 import mmh3
 import paramiko
 import uuid
+import ssl
 from io import BytesIO
+from typing import Optional
 from PIL import Image
 from urllib.parse import urlparse, urljoin
 from urllib3.util.retry import Retry
@@ -32,7 +34,7 @@ ASCII_LOGO = r'''
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌  
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌  
                                                    ▐▌  
-v0.0.2
+v0.0.3
 '''
 
 console = Console()
@@ -65,15 +67,15 @@ def configure_tor_proxy(host: str, port: int):
     session.proxies = {"http": proxy, "https": proxy}
 
 def get(url, **kwargs):
-    timeout = kwargs.pop('timeout', cfg.timeout)
+    timeout = kwargs.pop("timeout", cfg.timeout)
     return session.get(url, timeout=timeout, **kwargs)
 
 def head(url, **kwargs):
-    timeout = kwargs.pop('timeout', cfg.timeout)
+    timeout = kwargs.pop("timeout", cfg.timeout)
     return session.head(url, timeout=timeout, **kwargs)
 
 def options(url, **kwargs):
-    timeout = kwargs.pop('timeout', cfg.timeout)
+    timeout = kwargs.pop("timeout", cfg.timeout)
     return session.options(url, timeout=timeout, **kwargs)
 
 def show_help():
@@ -120,6 +122,12 @@ def check_tor_proxy():
     except RequestException:
         return False
 
+def report_tor_check(skip: bool) -> str:
+    if skip:
+        return "Skipped (--skip-tor-check)"
+    ok = check_tor_proxy()
+    return "OK (Tor SOCKS works via exit check.torproject.org)" if ok else "FAILED (may be expected for pure HS usage)"
+
 def shodan_favicon_hash(raw_content: bytes) -> int:
     img = Image.open(BytesIO(raw_content))
     frames = []
@@ -161,17 +169,16 @@ def detect_server(url):
 _REDIRECTS = {301, 302, 303, 307, 308}
 
 def get_onion_follow(url, **kwargs):
-    """
-    GET without auto-redirects; follow a single redirect only if target host is .onion.
-    Returns (response, leak_url). If leak_url is not None -> redirect to clearnet detected.
-    """
     r = get(url, allow_redirects=False, **kwargs)
     if r.status_code in _REDIRECTS:
         loc = r.headers.get("Location")
         if not loc:
             return r, None
         nxt = urljoin(url, loc)
-        host = (urlparse(nxt).hostname or "").lower()
+        pu = urlparse(nxt)
+        if pu.scheme not in ("http", "https"):
+            return None, nxt
+        host = (pu.hostname or "").lower()
         if host.endswith(".onion"):
             r2 = get(nxt, allow_redirects=False, **kwargs)
             return r2, None
@@ -240,8 +247,18 @@ def check_ssh_fingerprint(url, ssh_port: int = 22):
         sock = _make_socks_socket(host, ssh_port, cfg.timeout)
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(hostname=host, port=ssh_port, username=None, password=None,
-                  sock=sock, timeout=cfg.timeout, banner_timeout=cfg.timeout, auth_timeout=cfg.timeout)
+        c.connect(
+            hostname=host,
+            port=ssh_port,
+            username="onionscout",
+            password=None,
+            sock=sock,
+            timeout=cfg.timeout,
+            banner_timeout=cfg.timeout,
+            auth_timeout=cfg.timeout,
+            allow_agent=False,
+            look_for_keys=False
+        )
         t = c.get_transport()
         if not t:
             return "SSH transport not established"
@@ -273,9 +290,26 @@ def check_comments(url):
 
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+def is_valid_ipv4(ip: str) -> bool:
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return False
+        nums = [int(p) for p in parts]
+        return all(0 <= n <= 255 for n in nums)
+    except Exception:
+        return False
+
+def find_valid_ipv4(text: str) -> Optional[str]:
+    for m in IPV4_RE.finditer(text or ""):
+        ip = m.group(0)
+        if is_valid_ipv4(ip):
+            return ip
+    return None
+
 def _found_ip_leak(text: str) -> str:
-    m = IPV4_RE.search(text or "")
-    return f"; leaked IP: {m.group()}" if m else ""
+    ip = find_valid_ipv4(text or "")
+    return f"; leaked IP: {ip}" if ip else ""
 
 NGINX_STUB_RE = re.compile(
     r"Active connections:\s*\d+.*?server accepts handled requests\s*\d+\s+\d+\s+\d+.*?Reading:\s*\d+\s+Writing:\s*\d+\s+Waiting:\s*\d+",
@@ -284,11 +318,13 @@ NGINX_STUB_RE = re.compile(
 
 def check_status_pages(url):
     results = []
+    base = url.rstrip("/")
 
     try:
-        u = f"{url.rstrip('/')}/server-status?auto"
+        u = f"{base}/server-status?auto"
         r = get(u, allow_redirects=False)
-        if r.status_code == 200 and ("Total Accesses" in r.text or "ServerUptimeSeconds" in r.text):
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if r.status_code == 200 and ("text" in ct or "plain" in ct) and ("Total Accesses" in r.text) and ("ServerUptimeSeconds" in r.text or "Scoreboard" in r.text):
             results.append(f"/server-status?auto (Apache mod_status) OPEN{_found_ip_leak(r.text)}")
         elif r.status_code in (401, 403):
             results.append("/server-status?auto (Apache mod_status) protected")
@@ -296,9 +332,10 @@ def check_status_pages(url):
         pass
 
     try:
-        u = f"{url.rstrip('/')}/server-status"
+        u = f"{base}/server-status"
         r = get(u, allow_redirects=False)
-        if r.status_code == 200 and ("Apache Server Status" in r.text or "Scoreboard" in r.text):
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if r.status_code == 200 and ("html" in ct) and ("Apache Server Status" in r.text) and ("Scoreboard" in r.text):
             results.append(f"/server-status (Apache mod_status HTML) OPEN{_found_ip_leak(r.text)}")
         elif r.status_code in (401, 403):
             results.append("/server-status (Apache mod_status HTML) protected")
@@ -306,9 +343,10 @@ def check_status_pages(url):
         pass
 
     try:
-        u = f"{url.rstrip('/')}/server-info"
+        u = f"{base}/server-info"
         r = get(u, allow_redirects=False)
-        if r.status_code == 200 and ("Apache Server Information" in r.text or "Server Module" in r.text):
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        if r.status_code == 200 and ("html" in ct) and ("Apache Server Information" in r.text) and ("Server Module" in r.text):
             results.append("/server-info (Apache mod_info) OPEN")
         elif r.status_code in (401, 403):
             results.append("/server-info (Apache mod_info) protected")
@@ -316,7 +354,7 @@ def check_status_pages(url):
         pass
 
     try:
-        u = f"{url.rstrip('/')}/status"
+        u = f"{base}/status"
         r = get(u, allow_redirects=False)
         if r.status_code == 200 and NGINX_STUB_RE.search(r.text or ""):
             results.append("/status (nginx stub_status) OPEN")
@@ -327,7 +365,7 @@ def check_status_pages(url):
 
     try:
         for path in ("/webdav", "/"):
-            u = f"{url.rstrip('/')}{path}"
+            u = f"{base}{path}"
             r = options(u, allow_redirects=False)
             dav = r.headers.get("DAV") or r.headers.get("Dav")
             allow = r.headers.get("Allow", "")
@@ -339,33 +377,88 @@ def check_status_pages(url):
 
     return "\n".join(results) if results else "No status pages fingerprinted"
 
+def get_soft404_baseline(base_url: str):
+    rand = uuid.uuid4().hex
+    try:
+        r = get(f"{base_url.rstrip('/')}/{rand}", allow_redirects=False)
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        return {
+            "status": r.status_code,
+            "len": len(r.content or b""),
+            "ct": ct,
+            "sample": (r.text or "")[:200].lower()
+        }
+    except Exception:
+        return None
+
+def looks_like_soft404(r, baseline) -> bool:
+    if not baseline or not r:
+        return False
+    ct = (r.headers.get("Content-Type", "") or "").lower()
+    if "html" not in ct:
+        return False
+    blen = baseline.get("len", 0) or 0
+    rlen = len(r.content or b"")
+    if blen > 0:
+        ratio = abs(rlen - blen) / blen
+        if ratio < 0.12:
+            return True
+    body = (r.text or "").lower()
+    if "not found" in body or "404" in body:
+        return True
+    bs = baseline.get("sample") or ""
+    if bs and bs in body:
+        return True
+    return False
+
 def check_files_and_paths(url):
-    items = ["info.php", ".git", ".svn", ".hg", ".env", ".DS_Store", "security.txt"]
+    items = ["info.php", ".git", ".svn", ".hg", ".env", ".DS_Store"]
     paths = ["backup", "admin", "secret"]
     found = []
-    base = url.rstrip('/')
+    base = url.rstrip("/")
+    baseline = get_soft404_baseline(base)
+
     for f in items + paths:
         try:
             r = get(f"{base}/{f}", allow_redirects=False)
             if r.status_code == 200:
+                if looks_like_soft404(r, baseline):
+                    continue
                 prefix = "File" if f in items else "Path"
                 found.append(f"{prefix} found: /{f}")
         except RequestException:
             continue
+
     return "\n".join(found) if found else "No sensitive files or paths found"
 
 def check_external_resources(url):
     try:
-        r = get(url)
-        links = re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, re.IGNORECASE)
+        r = get(url, allow_redirects=False)
+        links = re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text or "", re.IGNORECASE)
         ext = [l for l in sorted(set(links)) if not (urlparse(l).hostname or "").endswith(".onion")]
         return "External resources:\n" + "\n".join(ext) if ext else "No external resources detected"
     except Exception as e:
         return f"Error fetching resources: {e}"
 
+PROTO_REL_RE = re.compile(r'(?:src|href)=["\'](//[^"\']+)["\']', re.IGNORECASE)
+
+def check_protocol_relative_links(url: str) -> str:
+    try:
+        r = get(url, allow_redirects=False)
+        links = PROTO_REL_RE.findall(r.text or "")
+        out = []
+        for l in sorted(set(links)):
+            full = "http:" + l
+            host = (urlparse(full).hostname or "").lower()
+            if host and not host.endswith(".onion"):
+                out.append(l)
+        return "Protocol-relative (//) external links:\n" + "\n".join(out) if out else "No protocol-relative external links"
+    except Exception as e:
+        return f"Error checking protocol-relative links: {e}"
+
 def check_cors(url):
     try:
-        r = get(url)
+        r = get(url, allow_redirects=False)
         ac = {k: v for k, v in r.headers.items() if k.lower().startswith("access-control-")}
         return "CORS headers:\n" + "\n".join(f"{k}: {v}" for k, v in ac.items()) if ac else "No CORS headers"
     except Exception as e:
@@ -376,8 +469,8 @@ CONTENT_ATTR_RE = re.compile(r'content=["\']([^"\']+)["\']', re.IGNORECASE)
 
 def check_meta_redirects(url):
     try:
-        r = get(url)
-        metas = META_REFRESH_RE.findall(r.text)
+        r = get(url, allow_redirects=False)
+        metas = META_REFRESH_RE.findall(r.text or "")
         out = []
         for m in metas:
             c = CONTENT_ATTR_RE.search(m)
@@ -393,17 +486,16 @@ def check_meta_redirects(url):
         return f"Error fetching meta tags: {e}"
 
 def check_robots_sitemap(url):
-    out, base = [], url.rstrip('/')
+    out, base = [], url.rstrip("/")
 
     try:
         r, leak = get_onion_follow(f"{base}/robots.txt")
         if leak:
             out.append(f"/robots.txt redirect leak → {leak}")
         elif r and r.status_code == 200 and r.text:
-            lines = [l for l in r.text.splitlines()
-                     if l.lower().startswith(("disallow:", "sitemap:"))]
+            lines = [l for l in r.text.splitlines() if l.lower().startswith(("disallow:", "sitemap:"))]
             if lines:
-                out.append(f"/robots.txt entries:\n" + "\n".join(lines))
+                out.append("/robots.txt entries:\n" + "\n".join(lines))
     except RequestException:
         pass
 
@@ -414,7 +506,7 @@ def check_robots_sitemap(url):
         elif r and r.status_code == 200 and r.text:
             locs = re.findall(r"<loc>([^<]+)</loc>", r.text, re.IGNORECASE)
             if locs:
-                out.append(f"/sitemap.xml locs:\n" + "\n".join(locs))
+                out.append("/sitemap.xml locs:\n" + "\n".join(locs))
     except RequestException:
         pass
 
@@ -422,18 +514,17 @@ def check_robots_sitemap(url):
 
 def check_form_actions(url):
     try:
-        r = get(url)
-        acts = re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
-        out = [a for a in sorted(set(acts))
-               if a.startswith(("http://", "https://")) and not (urlparse(a).hostname or "").endswith(".onion")]
+        r = get(url, allow_redirects=False)
+        acts = re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', r.text or "", re.IGNORECASE)
+        out = [a for a in sorted(set(acts)) if a.startswith(("http://", "https://")) and not (urlparse(a).hostname or "").endswith(".onion")]
         return "Form actions to clearnet:\n" + "\n".join(out) if out else "No clearnet form actions"
     except Exception as e:
         return f"Error fetching forms: {e}"
 
 def check_websocket_endpoints(url):
     try:
-        r = get(url)
-        wss = re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text, re.IGNORECASE)
+        r = get(url, allow_redirects=False)
+        wss = re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text or "", re.IGNORECASE)
         out = [ws for ws in sorted(set(wss)) if not (urlparse(ws).hostname or "").endswith(".onion")]
         return "WebSocket endpoints to clearnet:\n" + "\n".join(out) if out else "No clearnet WebSocket endpoints"
     except Exception as e:
@@ -441,7 +532,7 @@ def check_websocket_endpoints(url):
 
 def check_proxy_headers(url):
     try:
-        r = get(url)
+        r = get(url, allow_redirects=False)
         keys = ["X-Forwarded-For", "X-Real-IP", "Via", "Forwarded"]
         found = [f"{k}: {r.headers[k]}" for k in keys if k in r.headers]
         return "\n".join(found) if found else "No proxy-related headers"
@@ -451,18 +542,24 @@ def check_proxy_headers(url):
 def check_security_txt(url):
     try:
         r = get(f"{url.rstrip('/')}/.well-known/security.txt", allow_redirects=False)
-        return "security.txt:\n" + r.text.strip() if r.status_code == 200 else "security.txt not found"
+        return "security.txt (.well-known):\n" + r.text.strip() if r.status_code == 200 and r.text else "security.txt (.well-known) not found"
     except Exception as e:
-        return f"Error fetching security.txt: {e}"
+        return f"Error fetching security.txt (.well-known): {e}"
+
+def check_security_txt_root(url):
+    try:
+        r = get(f"{url.rstrip('/')}/security.txt", allow_redirects=False)
+        return "security.txt (root):\n" + r.text.strip() if r.status_code == 200 and r.text else "security.txt (root) not found"
+    except Exception as e:
+        return f"Error fetching security.txt (root): {e}"
 
 def check_captcha_leak(url):
     try:
-        r = get(url)
-        if r.status_code != 200 or not r.text:
+        r = get(url, allow_redirects=False)
+        if r.status_code != 200 or not (r.text or ""):
             return "No page to check for CAPTCHA leaks"
-        text = r.text.lower()
-        leaks = set(re.findall(
-            r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, re.IGNORECASE))
+        text = (r.text or "").lower()
+        leaks = set(re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, re.IGNORECASE))
         for path in ("/lua/cap.lua", "/queue.html"):
             if path in text:
                 for m in re.findall(r'["\']([^"\']+' + re.escape(path) + r')["\']', text):
@@ -474,7 +571,6 @@ def check_captcha_leak(url):
         return f"Error fetching page: {e}"
 
 def check_etag(url):
-    """ETag header value (HEAD -> GET fallback) + Shodan dork."""
     try:
         r = head(url, allow_redirects=False)
         etag = r.headers.get("ETag") or r.headers.get("Etag")
@@ -488,32 +584,121 @@ def check_etag(url):
     except Exception as e:
         return f"Error fetching ETag: {e}"
 
+def check_onion_location(url: str) -> str:
+    try:
+        r = get(url, allow_redirects=False)
+        val = r.headers.get("Onion-Location") or r.headers.get("onion-location")
+        if val:
+            return f"Onion-Location: {val}"
+        return "No Onion-Location header"
+    except Exception as e:
+        return f"Error checking Onion-Location: {e}"
+
+LEAK_HEADERS = [
+    "Server",
+    "X-Powered-By",
+    "X-AspNet-Version",
+    "X-AspNetMvc-Version",
+    "X-Runtime",
+    "X-Version",
+    "X-Generator",
+    "X-Drupal-Cache",
+    "X-Served-By",
+    "X-Backend",
+    "X-Backend-Server",
+    "X-Varnish",
+    "X-Cache",
+    "CF-RAY",
+    "X-Amz-Cf-Id",
+]
+
+def check_header_leaks(url: str) -> str:
+    try:
+        r = get(url, allow_redirects=False)
+        found = []
+        for k in LEAK_HEADERS:
+            if k in r.headers:
+                found.append(f"{k}: {r.headers.get(k)}")
+        return "Header leaks:\n" + "\n".join(found) if found else "No obvious header leaks"
+    except Exception as e:
+        return f"Error checking header leaks: {e}"
+
+WELL_KNOWN_PATHS = [
+    "/.well-known/security.txt",
+    "/.well-known/change-password",
+    "/.well-known/openid-configuration",
+    "/.well-known/assetlinks.json",
+    "/.well-known/webfinger",
+    "/.well-known/host-meta",
+    "/.well-known/host-meta.json",
+]
+
+def check_well_known(url: str) -> str:
+    base = url.rstrip("/")
+    hits = []
+    for pth in WELL_KNOWN_PATHS:
+        try:
+            r = get(f"{base}{pth}", allow_redirects=False)
+            if r.status_code == 200:
+                ct = (r.headers.get("Content-Type", "") or "").lower()
+                hits.append(f"{pth} -> 200 ({ct or 'n/a'})")
+        except Exception:
+            continue
+    return "Well-known endpoints:\n" + "\n".join(hits) if hits else "No .well-known endpoints found"
+
+def check_https_tls(url: str) -> str:
+    host = urlparse(url).hostname or ""
+    if not host:
+        return "HTTPS/TLS: invalid host"
+
+    https_url = f"https://{host}/"
+    try:
+        get(https_url, allow_redirects=False, timeout=min(cfg.timeout, 12))
+    except Exception as e:
+        return f"HTTPS/TLS: not reachable ({e})"
+
+    try:
+        raw = _make_socks_socket(host, 443, timeout=min(cfg.timeout, 12))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ssock = ctx.wrap_socket(raw, server_hostname=host)
+        cert = ssock.getpeercert()
+        ssock.close()
+
+        if not cert:
+            return "HTTPS/TLS: reachable on 443 but certificate not available"
+
+        subj = cert.get("subject") or []
+        issr = cert.get("issuer") or []
+        subject = ", ".join("=".join(x) for x in subj[0]) if subj and subj[0] else "n/a"
+        issuer = ", ".join("=".join(x) for x in issr[0]) if issr and issr[0] else "n/a"
+        nb = cert.get("notBefore", "n/a")
+        na = cert.get("notAfter", "n/a")
+        san = cert.get("subjectAltName", [])
+        san_str = ", ".join(f"{t}:{v}" for t, v in san) if san else "n/a"
+
+        return "HTTPS/TLS: reachable\n" + f"Subject: {subject}\nIssuer: {issuer}\nValid: {nb} -> {na}\nSAN: {san_str}"
+    except Exception as e:
+        return f"HTTPS/TLS: reachable, but TLS inspect failed ({e})"
+
 def main():
     if len(sys.argv) == 1:
         show_help()
         sys.exit(0)
 
-    parser = CustomParser(
-        description="Lightweight CLI for basic Tor hidden-service (.onion) security checks"
-    )
-    parser.add_argument("-t", "--timeout", type=float, default=10.0,
-                        help="HTTP timeout in seconds (default: 10.0)")
-    parser.add_argument("-s", "--sleep", type=float, default=3.0,
-                        help="Seconds between checks (default: 3.0)")
-    parser.add_argument("--socks", default="127.0.0.1:9050",
-                        help="Tor SOCKS5h proxy (default: 127.0.0.1:9050)")
-    parser.add_argument("--ssh-port", type=int, default=22,
-                        help="SSH port (default: 22)")
-    parser.add_argument("--skip-tor-check", action="store_true",
-                        help="Do not call check.torproject.org")
-    parser.add_argument("--json", action="store_true",
-                        help="Output JSON report")
-    parser.add_argument("-u", "--url", required=True,
-                        help=".onion URL to scan (e.g. abcdef.onion)")
+    parser = CustomParser(description="Lightweight CLI for basic Tor hidden-service (.onion) security checks")
+    parser.add_argument("-t", "--timeout", type=float, default=10.0, help="HTTP timeout in seconds (default: 10.0)")
+    parser.add_argument("-s", "--sleep", type=float, default=3.0, help="Seconds between checks (default: 3.0)")
+    parser.add_argument("--socks", default="127.0.0.1:9050", help="Tor SOCKS5h proxy (default: 127.0.0.1:9050)")
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--skip-tor-check", action="store_true", help="Do not call check.torproject.org")
+    parser.add_argument("--json", action="store_true", help="Output JSON report")
+    parser.add_argument("-u", "--url", required=True, help=".onion URL to scan (e.g. abcdef.onion)")
     args = parser.parse_args()
 
     cfg.timeout = args.timeout
-    cfg.sleep   = args.sleep
+    cfg.sleep = args.sleep
     socks_host, socks_port = parse_socks(args.socks)
     cfg.socks_host, cfg.socks_port = socks_host, socks_port
     configure_tor_proxy(socks_host, socks_port)
@@ -530,34 +715,44 @@ def main():
         sys.exit(1)
     base_url = f"{p.scheme}://{p.netloc}"
 
-    if not args.skip_tor_check and not check_tor_proxy():
-        console.print(ASCII_LOGO)
-        console.print("[yellow]Tor exit check failed (this may be expected). "
-                      "Use --skip-tor-check for hidden services.[/yellow]\n")
-
     if not args.json:
         console.print(ASCII_LOGO)
 
     tasks = [
-        ("Check Tor proxy",     lambda: "OK (skipped)" if args.skip_tor_check else "OK/Maybe (see note above)"),
-        ("Detect server",       lambda: detect_server(base_url)),
-        ("Detect favicon",      lambda: detect_favicon(base_url)),
-        ("Favicon in HTML",     lambda: detect_favicon_in_html(base_url)),
-        ("ETag header",         lambda: check_etag(base_url)),
-        ("SSH fingerprint",     lambda: check_ssh_fingerprint(base_url, args.ssh_port)),
-        ("Comments in code",    lambda: check_comments(base_url)),
-        ("Status pages",        lambda: check_status_pages(base_url)),
-        ("Files & paths",       lambda: check_files_and_paths(base_url)),
-        ("External resources",  lambda: check_external_resources(base_url)),
-        ("CORS headers",        lambda: check_cors(base_url)),
-        ("Meta-refresh",        lambda: check_meta_redirects(base_url)),
-        ("Robots & sitemap",    lambda: check_robots_sitemap(base_url)),
-        ("Form actions",        lambda: check_form_actions(base_url)),
+        ("SOCKS/Tor connectivity check", lambda: report_tor_check(args.skip_tor_check)),
+        ("Detect server", lambda: detect_server(base_url)),
+        ("HTTPS/TLS sanity", lambda: check_https_tls(base_url)),
+
+        ("Detect favicon", lambda: detect_favicon(base_url)),
+        ("Favicon in HTML", lambda: detect_favicon_in_html(base_url)),
+        ("ETag header", lambda: check_etag(base_url)),
+
+        ("Onion-Location header", lambda: check_onion_location(base_url)),
+        ("Header leaks", lambda: check_header_leaks(base_url)),
+
+        ("SSH fingerprint", lambda: check_ssh_fingerprint(base_url, args.ssh_port)),
+        ("Comments in code", lambda: check_comments(base_url)),
+        ("Status pages", lambda: check_status_pages(base_url)),
+
+        ("Files & paths", lambda: check_files_and_paths(base_url)),
+        ("Well-known endpoints", lambda: check_well_known(base_url)),
+
+        ("External resources", lambda: check_external_resources(base_url)),
+        ("Protocol-relative links", lambda: check_protocol_relative_links(base_url)),
+
+        ("CORS headers", lambda: check_cors(base_url)),
+        ("Meta-refresh", lambda: check_meta_redirects(base_url)),
+        ("Robots & sitemap", lambda: check_robots_sitemap(base_url)),
+        ("Form actions", lambda: check_form_actions(base_url)),
         ("WebSocket endpoints", lambda: check_websocket_endpoints(base_url)),
-        ("Proxy headers",       lambda: check_proxy_headers(base_url)),
-        ("security.txt",        lambda: check_security_txt(base_url)),
-        ("CAPTCHA leak",        lambda: check_captcha_leak(base_url)),
+        ("Proxy headers", lambda: check_proxy_headers(base_url)),
+
+        ("security.txt (root)", lambda: check_security_txt_root(base_url)),
+        ("security.txt (.well-known)", lambda: check_security_txt(base_url)),
+
+        ("CAPTCHA leak", lambda: check_captcha_leak(base_url)),
     ]
+
     total = len(tasks)
     results = []
 
@@ -576,7 +771,6 @@ def main():
         return
 
     console.print("\n[bold green]All steps complete[/bold green]\n")
-
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Check", style="bold")
     table.add_column("Result")
