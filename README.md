@@ -250,14 +250,3 @@ pipx uninstall onionscout
 ```bash
 pipx upgrade onionscout
 ```
-
-## ToDo
-- [x] Add Etag search (Shodan example: http.headers.etag:"5f6a3b7e2c1d4")
-- [x] Remove false positives for status pages
-- [x] Reduce false positives for file/path hits (soft-404 baseline)
-- [x] Add HTTPS/TLS sanity check
-- [x] Add Onion-Location + header leak checks
-- [x] Add .well-known enumeration + protocol-relative dependency detection
-- [x] Add report export to file (-o/--output)
-- [x] Add minimal crawler (same host, depth-limited)
-- [x] Add indicators extraction (emails + crypto addresses)
