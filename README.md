@@ -170,6 +170,33 @@ Tune timeouts:
 onionscout -u exampleonionaddress.onion --http-timeout 20 --ssh-timeout 8 --tls-timeout 12
 ```
 
+## Authenticated scans
+
+Some onion services require an authenticated session. You can pass a raw HTTP `Cookie` header with `--cookie`.
+
+Example:
+
+```bash
+onionscout -u http://exampleonionaddress.onion --cookie 'access=abcd1234'
+```
+
+For multiple cookies, use the normal HTTP header format:
+
+```bash
+onionscout -u http://exampleonionaddress.onion --cookie 'access=VALUE; session=VALUE2; csrftoken=VALUE3'
+```
+
+How to get the cookie value from a browser:
+
+1. Log in to the target service.
+2. Open Developer Tools.
+3. Go to Storage / Cookies.
+4. Select the target onion domain.
+5. Copy the cookie name and value.
+6. Pass it as `name=value`.
+
+Do not share session cookies. They are equivalent to temporary access tokens for your logged-in session.
+
 ## Options
 
 ```
@@ -182,7 +209,7 @@ onionscout -u exampleonionaddress.onion --http-timeout 20 --ssh-timeout 8 --tls-
 --tls-timeout         TLS timeout
 --ssh-port            SSH port for fingerprint check
 --retries             Retries for transient onion/Tor errors
---cookie              Raw Cookie header
+--cookie              Raw HTTP Cookie header, e.g. 'access=VALUE; session=VALUE2'
 --insecure-https      Disable HTTPS certificate verification for HTTP requests
 --no-crawl            Disable crawler-based checks
 --max-urls            Crawler URL limit
