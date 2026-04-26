@@ -19,13 +19,16 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
+          python-version: "3.12"
 
       - name: Install build
-        run: python -m pip install --upgrade build
+        run: python -m pip install --upgrade build twine
 
       - name: Build wheel and sdist
         run: python -m build
+
+      - name: Check package
+        run: twine check dist/*
 
       - name: Store distributions
         uses: actions/upload-artifact@v5

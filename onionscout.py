@@ -50,7 +50,7 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.1.3
+v0.1.4
 """
 
 console = Console()
@@ -1992,7 +1992,7 @@ def main() -> None:
 
     payload = {
         "tool": "onionscout",
-        "version": "0.1.3",
+        "version": "0.1.4",
         "target": base_url,
         "config": {
             "http_timeout": cfg.http_timeout,
