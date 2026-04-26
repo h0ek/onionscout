@@ -1,252 +1,199 @@
 # onionscout
 
-![onionscout](onionscout.webp)
+![onionscout](https://raw.githubusercontent.com/h0ek/onionscout/refs/heads/main/onionscout.webp)
 
-**onionscout** is a lightweight CLI for basic security-checks of Tor hidden services (.onion).
+**onionscout** is a lightweight CLI tool for auditing Tor hidden services (`.onion`) for common security misconfigurations, clearnet dependencies, metadata leaks, fingerprinting indicators, and basic de-anonymization risks.
 
-> **Disclaimer:**  
-> This is *not* a full-blown pentesting or “super-hacker” tool. It’s a simple, low-hanging-fruit scanner designed to help you quickly spot common misconfigurations and basic information leaks on a Tor hidden service. Use it as a first pass, not a replacement for a thorough security audit.
+It is designed as a first-pass audit helper, not a full penetration-testing framework.
 
-## Checks
+> Use only against systems you own or are authorized to assess.
 
-1. **SOCKS/Tor connectivity check**  
-   - Calls `get("http://check.torproject.org", timeout=5)` via `session` configured with `socks5h://127.0.0.1:9050`.  
-   - Returns pass/fail (or `Skipped (--skip-tor-check)` when disabled).
+## Features
 
-2. **Cookie provided (optional)**
-   - If `--cookie` is set, sends it as a raw `Cookie:` header with all requests.
-   - Report shows `YES (N chars)` or `NO`.
+### Network and origin handling
 
-3. **Detect server**  
-   - `get(url)` fetches the homepage and inspects `r.headers.get("Server")`.  
-   - Generates a random UUID path and requests `GET {url}/{UUID}` **with redirects disabled**.  
-   - If it returns 404, inspects the body via `re.search(r"(apache|nginx|lighttpd)(?:/([\d\.]+))?")` to infer server type/version from default error pages.
-  
-4. **HTTPS/TLS sanity**
-   -  Probes `https://<onion>/` (port 443) via Tor SOCKS.
-   -  If reachable, extracts basic TLS certificate metadata (Subject, Issuer, Validity, SAN).
-   -  If not reachable, reports `HTTPS/TLS: not reachable`.
+- Tor SOCKS5h support
+- smart HTTP/HTTPS origin selection
+- `.onion`-safe redirect policy
+- redirect leak detection to clearnet
+- retry handling for common onion/Tor network errors
+- separate HTTP, SSH, and TLS timeouts
 
-4. **Detect favicon**
-   - Requests `/favicon.ico` using **controlled redirects**: follow at most one redirect **only if** the target host ends with `.onion`; a redirect to clearnet is reported as `Favicon redirect leak → <url>`.
-   - Computes Shodan-compatible MurmurHash3 over the favicon bytes (same approach as Shodan/favscan conceptually: hash of the favicon “data”).
-   - Prints a ready Shodan dork: `http.favicon.hash:<hash>`.
-     
-5. **Favicon in HTML**  
-   - Fetches the homepage, locates `<link rel="...icon..." href="...">` via  
-        `r'<link\s+[^>]*rel=["\']([^"\']*icon[^"\']*)["\'][^>]*href=["\']([^"\']+)'`.  
-   - Resolves relative URLs and fetches using the same **controlled redirect** policy as in step 3 (clearnet redirects reported as `Favicon HTML redirect leak(s)`).  
-   - Hashing identical to step 4 and prints `http.favicon.hash:<hash>` (Shodan dork).
- 
-6. **ETag header**  
-   - Attempts `HEAD` first (no redirects), then `GET` fallback.  
-   - If `ETag` present, normalizes quotes and prints value plus Shodan dork: `http.headers.etag:"<value>"`.  
+### Web fingerprinting
 
-7. **SSH fingerprint**  
-   - Parses hostname from `urlparse(url).hostname`.  
-   - Connects via Paramiko **through Tor** by injecting a SOCKS5 socket (PySocks) with `rdns=True` (DNS for `.onion` resolved inside Tor).  
-   - Obtains server key via `get_remote_server_key().get_fingerprint()`, formats as colon-separated hex and includes key type (e.g., `ssh-ed25519`).  
-   - Default port 22; override with `--ssh-port`. Connection refused simply means SSH isn’t exposed.
-   - Uses `allow_agent=False` and `look_for_keys=False` to reduce auth noise; it only needs the host key. 
+- web server header detection
+- default error-page fingerprinting
+- favicon discovery and Shodan-compatible favicon hash
+- ETag extraction and Shodan query helper
+- TLS reachability, TLS version, cipher, certificate SHA256, issuer, subject, and validity
 
-8. **Comments in code**  
-   - Downloads HTML; finds `<!-- … -->` blocks with `re.findall(r"<!--([\s\S]*?)-->", r.text)`.  
-   - Splits each comment on newlines and trims whitespace to surface notes/tokens.  
+### Leak and de-anonymization checks
 
-9. **Status pages**  
-   - Probes with redirects disabled:  
-      - Apache **mod_status**: `/server-status?auto` (looks for `Total Accesses`, `ServerUptimeSeconds`, `Scoreboard`) and `/server-status` (HTML “Apache Server Status”/`Scoreboard`).  
-      - Apache **mod_info**: `/server-info` (texts like “Apache Server Information”, “Server Module”).  
-      - **nginx stub_status**: `/status` (plaintext pattern with `Active connections:` and `Reading:/Writing:/Waiting:`).  
-      - **WebDAV**: `OPTIONS` on `/webdav` then `/`; presence of `DAV` header or `Allow` containing `PROPFIND`/`MKCOL`.  
-   - If accessible, reports OPEN/protected; scans body for valid IPv4 leakage and appends ; `leaked IP: <ip>`.  
+- clearnet redirects
+- external active resources
+- external links
+- CSP / CSP-Report-Only external allowances
+- Report-To / NEL / Link header leakage
+- canonical / alternate / OpenGraph / Twitter metadata leaks
+- protocol-relative external links
+- meta-refresh redirects
+- clearnet form actions
+- clearnet WebSocket endpoints
+- Onion-Location header
+- proxy-related headers
+- common fingerprinting headers
 
-10. **Files & paths**
-   - Checks common sensitive files (`info.php`, `.git`, `.svn`, `.hg`, `.env`, `.DS_Store`, etc.) and directories (`admin`, `backup`, `secret`).
-   - Uses redirects disabled.
-   - Includes a **soft-404 / catch-all 200 filter**: it first fetches a random non-existent path as a baseline, then skips results that look like the same “default page/index” response (reduces false positives when the server returns 200 for everything).
+### Hidden-service hygiene checks
 
-11. **External resources**  
-   - Parses the homepage with `re.findall(r'(?:src|href)=["\'](https?://[^"\']+)["\']', r.text, flags=IGNORECASE)`.  
-   - Filters out URLs whose hostname ends with `.onion`, listing any clearnet dependencies (JS, CSS, images).  
+- Apache `mod_status`
+- Apache `mod_info`
+- nginx `stub_status`
+- WebDAV exposure
+- common sensitive files and paths
+- `.well-known/*` endpoints
+- `robots.txt`
+- `sitemap.xml`
+- `security.txt` at root and `.well-known`
+- CAPTCHA-related external resource leakage
+- Set-Cookie attributes:
+  - Secure
+  - HttpOnly
+  - SameSite
+  - Domain
 
-12. **CORS headers**  
-   - After `get(url)`, iterates `r.headers.items()`, selects any keys starting with `Access-Control-`.  
-   - Prints each `header: value` or “No CORS headers” if none found.  
+### Content indicators
 
-13. **Meta-refresh**  
-   - Finds `<meta http-equiv="refresh" ...>` tags via `re.findall(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+>', r.text, flags=IGNORECASE)`.  
-   - Extracts the `content="…url=TARGET"` portion; if `TARGET` begins with `http://` or `https://` and isn’t `.onion`, reports it as a clearnet redirect.  
+- minimal same-host crawler
+- email extraction
+- obfuscated email extraction, for example `name(at)domain(dot)tld`
+- placeholder email separation, for example `example.com`
+- BTC / ETH / XMR address indicators
+- HTML comments review
+- comment-based IP, URL, JWT, private key, and secret-candidate detection
 
-14. **Robots & sitemap**  
-   - Requests `/robots.txt` and `/sitemap.xml` using **controlled redirects**: follow one hop only if the redirect stays within `.onion`; clearnet redirects are reported as `/<file> redirect leak → <url>`.  
-   - For `robots.txt`, extracts lines starting with `Disallow:` or `Sitemap:`.  
-   - For `sitemap.xml`, extracts all URLs inside `<loc>…</loc>`.  
+### Output
 
-15. **Form actions**  
-   - Searches HTML for `<form ... action="…">` with `re.findall`.  
-   - Reports any actions pointing to non-`.onion` hosts (i.e., `action="http://..."`), which could leak form data.  
-
-16. **WebSocket endpoints**  
-   - Uses `re.findall(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', r.text, flags=IGNORECASE)` to detect JavaScript WS/WSS connections.  
-   - Filters out any whose hostname ends with `.onion`, exposing clearnet sockets.  
-
-17. **Proxy headers**  
-   - Checks response headers for `X-Forwarded-For`, `X-Real-IP`, `Via`, `Forwarded`.  
-   - Prints their values if present (may reveal upstream/client info) or “No proxy-related headers”.  
-
-18. **CAPTCHA leak**  
-   - Lowers page text and finds all URLs containing `captcha` via  
-      `re.findall(r'(?:src|href|fetch\()\s*["\'](https?://[^"\')]+captcha[^"\')]+)', text, flags=IGNORECASE)`.  
-   - Additionally searches for `/lua/cap.lua` and `/queue.html`, resolves relative paths, and filters out `.onion` hosts — exposing external CAPTCHA services.
-
-19. **Onion-Location header**
-   - Reports `Onion-Location` header if present.
-   
-20. **Header leaks**
-   - Highlights common fingerprinting/leak headers (e.g., `Server`, `X-Powered-By`, `X-Generator`, etc.).
-   
-21. **Well-known endpoints**
-   - Probes common `/.well-known/*` endpoints and reports those returning HTTP 200.
-   
-22. **Protocol-relative links**
-   - Detects `src/href="//..."` dependencies and reports non-`.onion` hosts.
-
-23. **security.txt (root)**
-   - Requests `/security.txt` using **controlled redirects** (clearnet redirect is reported as a leak).
-   - Validates if the response looks like a real `security.txt` (directive-based).
-   - If it returns HTML/index/soft404, reports: `HTTP 200 but NOT valid security.txt`.
-
-24. **security.txt (.well-known)**
-   - Requests `/.well-known/security.txt` using **controlled redirects** (clearnet redirect is reported as a leak).
-   - Validates if the response looks like a real `security.txt` (directive-based).
-   - If it returns HTML/index/soft404, reports: `HTTP 200 but NOT valid security.txt`.
-
-25. **Crawl links**
-   - Minimal crawler to collect more internal URLs from the target hidden service.
-   - Scope:
-     - max 80 URLs
-     - depth 1
-     - same `.onion` host only
-   - Parses: `<a href>`, `<link href>`, `<img src>`, `<script src>`
-   - Skips common static assets by extension (images/fonts/archives/etc.)
-   - Tries to ignore catch-all 200/index/soft404 pages using:
-     - soft404 baseline
-     - homepage HTML fingerprint (hash)
-
-26. **Indicators (emails/crypto)**
-   - Extracts useful “signals” from crawled HTML pages:
-     - Emails
-     - BTC addresses
-     - ETH addresses
-     - XMR addresses (simplified regex indicator)
-   - Printed as grouped output in the final report.
+- human-readable Rich table
+- JSON output for automation
+- optional report file export
 
 ## Requirements
-- Python 3.10+  
-- Tor SOCKS5h available at `127.0.0.1:9050` (Tor daemon) or `127.0.0.1:9150` (Tor Browser) or `10.152.152.10:9050` (Whonix Gateway)
-- **pipx** (recommended)
 
-## Installation via pipx
-**Install pipx** (if you haven’t already):  
+- Python 3.10+
+- Tor SOCKS proxy:
+  - Tor daemon: `127.0.0.1:9050`
+  - Tor Browser: `127.0.0.1:9150`
+  - Whonix Gateway example: `10.152.152.10:9050`
+
+## Installation
+
+### From PyPI
+
 ```bash
-python3 -m pip install --user pipx
-pipx ensurepath
+pipx install onionscout
 ```
+### From GitHub
 
-**Install onionscout**
-```bash
+```
 pipx install git+https://github.com/h0ek/onionscout.git
 ```
 
+For local development:
+
+```
+git clone https://github.com/h0ek/onionscout.git
+cd onionscout
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -U pip
+python3 -m pip install -e .
+python3 onionscout.py -u <ONION_URL> --skip-tor-check
+```
+
 ## Usage
-Show help
-```bash
-onionscout
-```
 
-Usage
-```bash
-onionscout [-t TIMEOUT] [-s SLEEP] [--socks HOST:PORT] [--ssh-port PORT] [--cookie COOKIE] [--skip-tor-check] [--json] [-o OUTPUT] -u URL
 ```
-
-Run a scan
-```bash
 onionscout -u <ONION_URL>
 ```
-### Examples
-```bash
-# Standard scan (Tor daemon on 9050)
-onionscout -u <ONION_URL> --skip-tor-check --socks 127.0.0.1:9050
 
-# Using Tor Browser SOCKS (usually 9150)
-onionscout -u <ONION_URL> --skip-tor-check --socks 127.0.0.1:9150
+Example:
 
-# Using Whonix Gateway SOCKS (example)
-onionscout -u <ONION_URL> --skip-tor-check --socks 10.152.152.10:9050
-
-# Provide cookies (raw Cookie header) for sites with simple access-gates
-onionscout -u <ONION_URL> --cookie 'session=Q75ibZ5SIyqshx5jtFUK8v%2BPM6%2FGORzcTpGgZ%2BB34swS; access=bdda413a3cee5def4ceb53adbfa57068'
-
-# Increase HTTP timeout and slow down between checks
-onionscout -u <ONION_URL> -t 20 -s 5
-
-# Specify custom SSH port for fingerprinting
-onionscout -u <ONION_URL> --ssh-port 2222
-
-# Save report to a file (TXT by default)
-onionscout -u <ONION_URL> -o report.txt
-
-# Save machine-readable JSON to a file
-onionscout -u <ONION_URL> --json -o report.json
+```
+onionscout -u http://exampleonionaddress.onion --skip-tor-check
 ```
 
-## Command-line Options
+Use Tor Browser SOCKS:
 
-The script accepts the following parameters:
-
-`-u, --url <onion_url>`  
-**Required.** The target .onion address to scan (e.g., `abcdef1234567890.onion`).
-
-`-t, --timeout <seconds>`  
-**Optional.** HTTP request timeout in seconds.  
-**Default:** `10.0`
-
-`-s, --sleep <seconds>`  
-**Optional.** Delay between each check, in seconds.  
-**Default:** `3.0`
-
-`--socks <HOST:PORT>`  
-**Optional.** Tor SOCKS5h proxy (remote DNS) used for all HTTP(S) checks and SSH via SOCKS.  
-**Default:** `127.0.0.1:9050`  
-*(Tor Browser is typically `127.0.0.1:9150`.)*
-
-`--ssh-port <port>`  
-**Optional.** SSH port used by the SSH fingerprint check.  
-**Default:** `22`
-
-`--skip-tor-check`  
-**Optional.** Skip calling `check.torproject.org`.  
-
-`--cookie <COOKIE>`
-**Optional.** Raw `Cookie` header value sent with all HTTP(S) requests.  
-Use it when a hidden service requires a simple access cookie to view content.  
-**Example:** `--cookie 'access=...; session=...'`
-
-`--json`  
-**Optional.** Print the final report as JSON (useful for automation).
-
-`-o, --output <path>`
-**Optional.** Write the final report to a file.
-   - If `--json` is set → writes JSON
-   - Otherwise → writes a TXT report (human-readable)
-
-## Uninstall
-```bash
-pipx uninstall onionscout
+```
+onionscout -u http://exampleonionaddress.onion --socks 127.0.0.1:9150 --skip-tor-check
 ```
 
-## Update
-```bash
-pipx upgrade onionscout
+Force HTTP:
+
 ```
+onionscout -u exampleonionaddress.onion --scheme http
+```
+
+Force HTTPS:
+
+```
+onionscout -u exampleonionaddress.onion --scheme https --insecure-https
+```
+
+Save TXT report:
+
+```
+onionscout -u exampleonionaddress.onion -o report.txt
+```
+
+Save JSON report:
+
+```
+onionscout -u exampleonionaddress.onion --json -o report.json
+```
+
+Disable crawler:
+
+```
+onionscout -u exampleonionaddress.onion --no-crawl
+```
+
+Tune crawler:
+
+```
+onionscout -u exampleonionaddress.onion --max-urls 150 --depth 2
+```
+
+Tune timeouts:
+
+```
+onionscout -u exampleonionaddress.onion --http-timeout 20 --ssh-timeout 8 --tls-timeout 12
+```
+
+## Options
+
+```
+-u, --url              Target .onion URL
+--scheme              Origin scheme mode: auto, http, https
+--socks               SOCKS5h proxy, default 127.0.0.1:9050
+--skip-tor-check      Skip check.torproject.org connectivity check
+--http-timeout        HTTP timeout
+--ssh-timeout         SSH timeout
+--tls-timeout         TLS timeout
+--ssh-port            SSH port for fingerprint check
+--retries             Retries for transient onion/Tor errors
+--cookie              Raw Cookie header
+--insecure-https      Disable HTTPS certificate verification for HTTP requests
+--no-crawl            Disable crawler-based checks
+--max-urls            Crawler URL limit
+--depth               Crawler depth
+--json                Output JSON
+-o, --output          Save report to file
+```
+
+## Notes
+
+- Most onion services use plain HTTP internally; HTTPS is supported when present.
+- In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
+- Redirects are followed only when they stay on `.onion`; clearnet redirects are reported as leaks.
+- Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
