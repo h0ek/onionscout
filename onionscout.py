@@ -15,6 +15,8 @@ import uuid
 import ssl
 import base64
 import hashlib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Optional, Any
 from urllib.parse import urlparse, urljoin
@@ -50,12 +52,13 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.1.5
+v0.2.0
 """
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
 SECURITYTXT_MAX_BYTES = 200_000
+CORS_PROBE_ORIGIN = "http://corsprobeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"
 
 
 @dataclass
@@ -75,6 +78,7 @@ class Config:
     workers: int = 4
     cookie_header: Optional[str] = None
     target_host: str = ""
+    clearnet_url: Optional[str] = None
 
 
 cfg = Config()
@@ -264,6 +268,8 @@ XMR_RE = re.compile(r"\b[48][0-9AB][1-9A-HJ-NP-Za-km-z]{90,105}\b")
 ICON_COMMENT_RE = re.compile(r"<!--([\s\S]*?)-->", re.IGNORECASE)
 WEBSOCKET_RE = re.compile(r'new\s+WebSocket\(["\'](ws[s]?://[^"\']+)["\']', re.IGNORECASE)
 PROTO_REL_RE = re.compile(r'(?:src|href)=["\'](//[^"\']+)["\']', re.IGNORECASE)
+URL_LITERAL_RE = re.compile(r'(?P<url>(?:https?|wss?)://[^\s"\'<>)]+|//[a-z0-9.-]+\.[a-z]{2,}[^\s"\'<>)]*)', re.IGNORECASE)
+SOURCE_MAP_RE = re.compile(r'sourceMappingURL\s*=\s*([^\s*]+)', re.IGNORECASE)
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{3}\b|\b(?:\d{1,3}\.){3}\d{1,2}\b")
 NGINX_STUB_RE = re.compile(
     r"Active connections:\s*\d+.*?server accepts handled requests\s*\d+\s+\d+\s+\d+.*?Reading:\s*\d+\s+Writing:\s*\d+\s+Waiting:\s*\d+",
@@ -290,6 +296,46 @@ WELL_KNOWN_PATHS = [
     "/.well-known/webfinger",
     "/.well-known/host-meta",
     "/.well-known/host-meta.json",
+]
+
+SECURITY_HEADER_EXPECTATIONS = {
+    "Content-Security-Policy": "helps reduce script/content injection and unwanted external dependencies",
+    "X-Content-Type-Options": "should normally be nosniff",
+    "Referrer-Policy": "reduces accidental URL/referrer leakage",
+    "X-Frame-Options": "or use CSP frame-ancestors",
+    "Permissions-Policy": "limits browser feature exposure",
+    "Cross-Origin-Opener-Policy": "browser isolation hardening",
+    "Cross-Origin-Resource-Policy": "cross-origin resource isolation",
+}
+
+HTTP_METHODS_TO_CHECK = ["OPTIONS", "TRACE", "PUT", "DELETE", "PATCH", "PROPFIND", "MKCOL"]
+DANGEROUS_HTTP_METHODS = {"TRACE", "PUT", "DELETE", "PATCH", "PROPFIND", "MKCOL"}
+
+SENSITIVE_PATHS = [
+    "/info.php", "/phpinfo.php", "/.env", "/.env.local", "/.env.production",
+    "/.git/HEAD", "/.git/config", "/.svn/entries", "/.hg/requires",
+    "/.DS_Store", "/.htaccess", "/.htpasswd",
+    "/config.php", "/config.json", "/config.yml", "/configuration.php",
+    "/composer.json", "/composer.lock", "/package.json", "/package-lock.json", "/yarn.lock",
+    "/backup.zip", "/backup.tar.gz", "/backup.tgz", "/backup.sql", "/db.sql", "/dump.sql",
+    "/debug", "/admin", "/backup", "/backups", "/secret", "/server-status", "/server-info",
+]
+
+DIRECTORY_LISTING_PATHS = ["/", "/uploads/", "/files/", "/static/", "/media/", "/backup/", "/backups/", "/data/", "/logs/"]
+DIRECTORY_LISTING_RE = re.compile(
+    r"(<title>\s*Index of\s*/|Index of /|Parent Directory|Directory listing for /|\[ICO\].*?\[DIR\])",
+    re.IGNORECASE | re.DOTALL,
+)
+
+JS_SCAN_MAX_FILES = 10
+JS_SCAN_MAX_BYTES = 300_000
+IMAGE_METADATA_MAX_IMAGES = 8
+IMAGE_METADATA_MAX_BYTES = 2_000_000
+IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|tiff?)$", re.IGNORECASE)
+IMAGE_METADATA_MARKERS = [
+    b"Exif\x00\x00", b"http://", b"https://", b"GPS", b"GPSLatitude", b"GPSLongitude",
+    b"Software", b"CreatorTool", b"ImageDescription", b"Artist", b"Copyright",
+    b"Adobe", b"Photoshop", b"GIMP", b"Lightroom", b"Make", b"Model", b"xmpmeta",
 ]
 
 
@@ -331,8 +377,6 @@ class _WarningsSilenced:
 
 
 def probe_origin(base_url: str, timeout: float = 8.0) -> dict[str, Any]:
-    # Intentional verify=False here: this is only an origin reachability probe.
-    # Many onion HTTPS services use self-signed or non-public CA certificates.
     try:
         with _WarningsSilenced():
             res = fetch_with_policy(base_url, timeout=timeout, max_hops=2, verify=False)
@@ -389,7 +433,6 @@ def choose_working_origin(raw_url: str, scheme_mode: str = "auto") -> tuple[str,
     preferred = _base_from_parsed(p)
     candidates.append(preferred)
 
-    # In auto mode prefer HTTPS, but also test HTTP because many onion services are HTTP-only.
     https_base = _base_for_scheme(p, "https")
     http_base = _base_for_scheme(p, "http")
     for c in (https_base, http_base):
@@ -409,7 +452,6 @@ def choose_working_origin(raw_url: str, scheme_mode: str = "auto") -> tuple[str,
             "note": "no working HTTP/HTTPS origin found",
         }
 
-    # Prefer effective HTTPS, then any HTTPS input, then first working.
     effective_https = [a for a in ok_attempts if a.get("final_scheme") == "https"]
     if effective_https:
         chosen = effective_https[0]
@@ -1034,26 +1076,36 @@ def looks_like_soft404(r, baseline) -> bool:
 def check_files_and_paths(url: str) -> dict[str, Any]:
     name = "Files & paths"
     try:
-        items = ["info.php", ".git", ".svn", ".hg", ".env", ".DS_Store"]
-        paths = ["backup", "admin", "secret"]
         found = []
+        raw = []
         baseline = get_soft404_baseline(url.rstrip("/"))
-        for f in items + paths:
-            target = f"{url.rstrip('/')}/{f}"
+        for path in SENSITIVE_PATHS:
+            target = f"{url.rstrip('/')}{path}"
             res = fetch_with_policy(target)
             if res.get("leak"):
-                found.append(f"/{f} redirect leak \u2192 {res['leak']}")
+                found.append(f"{path} redirect leak → {res['leak']}")
+                raw.append({"path": path, "leak": res.get("leak")})
                 continue
             r = res.get("response")
-            if r and r.status_code == 200 and not looks_like_soft404(r, baseline):
-                prefix = "File" if f in items else "Path"
-                found.append(f"{prefix} found: /{f}")
+            if not r:
+                continue
+            if r.status_code == 200 and not looks_like_soft404(r, baseline):
+                ct = (r.headers.get("Content-Type", "") or "").lower()
+                size = len(r.content or b"")
+                sample = (r.text or "")[:120].replace("\n", " ").strip() if "text" in ct or "json" in ct or "html" in ct or not ct else ""
+                found.append(f"{path} found (HTTP 200, {size} bytes, ct={ct or 'n/a'})")
+                raw.append({"path": path, "status": r.status_code, "content_type": ct, "size": size, "sample": sample})
+            elif r.status_code in (401, 403) and path in {"/.git/config", "/.env", "/server-status", "/server-info", "/admin"}:
+                found.append(f"{path} protected (HTTP {r.status_code})")
+                raw.append({"path": path, "status": r.status_code})
         if not found:
             return finding(name, "info", "info", "No sensitive files or paths found")
-        return finding(name, "warn", "medium", found, raw={"count": len(found)})
+        high_markers = ("/.env", "/.git/config", "backup", "dump.sql", "db.sql", "phpinfo")
+        risk = "high" if any(any(m in x.lower() for m in high_markers) and "HTTP 200" in x for x in found) else "medium"
+        status = "warn" if any("HTTP 200" in x or "redirect leak" in x for x in found) else "info"
+        return finding(name, status, risk, found, raw={"count": len(found), "items": raw}, finding_type="exposure")
     except Exception as e:
         return error_finding(name, e)
-
 
 def _resolve_candidates(base_url: str, values: list[str]) -> list[str]:
     out = []
@@ -1069,6 +1121,349 @@ def _is_clearnet(full: str) -> bool:
     return bool(host) and not host.endswith(".onion")
 
 
+def _is_onion(full: str) -> bool:
+    host = (urlparse(full).hostname or "").lower()
+    return bool(host) and host.endswith(".onion")
+
+
+def _resolve_literal_url(base_url: str, value: str) -> Optional[str]:
+    v = (value or "").strip().strip('"\'')
+    if not v or v.startswith(("data:", "blob:", "javascript:", "mailto:", "tel:")):
+        return None
+    if v.startswith("//"):
+        scheme = urlparse(base_url).scheme or "http"
+        v = f"{scheme}:{v}"
+    return urljoin(base_url, v).split("#", 1)[0]
+
+
+def _header_value(headers, name: str) -> str:
+    if not headers:
+        return ""
+    return headers.get(name) or headers.get(name.lower()) or headers.get(name.title()) or ""
+
+
+def check_security_headers(url: str) -> dict[str, Any]:
+    name = "Security headers"
+    try:
+        res = fetch_with_policy(url)
+        if res.get("leak"):
+            return finding(name, "fail", "high", f"Redirect leak → {res['leak']}", raw=res, finding_type="deanon")
+        r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
+
+        headers = r.headers or {}
+        present = {}
+        missing = []
+        issues = []
+
+        for hdr, desc in SECURITY_HEADER_EXPECTATIONS.items():
+            val = _header_value(headers, hdr)
+            if val:
+                present[hdr] = val
+            else:
+                if hdr == "X-Frame-Options" and "frame-ancestors" in (_header_value(headers, "Content-Security-Policy").lower()):
+                    present[hdr] = "covered by CSP frame-ancestors"
+                    continue
+                missing.append(f"{hdr} missing ({desc})")
+
+        xcto = _header_value(headers, "X-Content-Type-Options")
+        if xcto and xcto.lower().strip() != "nosniff":
+            issues.append(f"X-Content-Type-Options is '{xcto}', expected 'nosniff'")
+
+        if urlparse(url).scheme == "https" and not _header_value(headers, "Strict-Transport-Security"):
+            missing.append("Strict-Transport-Security missing on HTTPS origin")
+
+        evidence = {"present": present, "missing": missing, "issues": issues}
+        if issues:
+            return finding(name, "warn", "medium", evidence, raw=evidence, finding_type="policy")
+        if len(missing) >= 3:
+            return finding(name, "warn", "low", evidence, raw=evidence, finding_type="policy")
+        if missing:
+            return finding(name, "info", "low", evidence, raw=evidence, finding_type="policy")
+        return finding(name, "ok", "low", "Common security headers present", raw=evidence, finding_type="policy")
+    except Exception as e:
+        return error_finding(name, e)
+
+
+def check_http_methods(url: str) -> dict[str, Any]:
+    name = "HTTP methods"
+    try:
+        base = url.rstrip("/") + "/"
+        found = []
+        raw = []
+
+        opt = fetch_with_policy(base, method="OPTIONS")
+        if opt.get("leak"):
+            return finding(name, "fail", "high", f"OPTIONS redirect leak → {opt['leak']}", raw=opt, finding_type="deanon")
+
+        allow_methods = set()
+        r_opt = opt.get("response")
+        if r_opt:
+            allow = r_opt.headers.get("Allow", "") or r_opt.headers.get("Access-Control-Allow-Methods", "")
+            for m in re.split(r"[,\s]+", allow.upper()):
+                if m:
+                    allow_methods.add(m.strip())
+            raw.append({"method": "OPTIONS", "status": r_opt.status_code, "allow": allow})
+
+        advertised_dangerous = sorted(allow_methods & DANGEROUS_HTTP_METHODS)
+        for method in advertised_dangerous:
+            found.append(f"{method}: advertised in Allow header")
+
+        trace = fetch_with_policy(base, method="TRACE", max_hops=0)
+        if trace.get("leak"):
+            found.append(f"TRACE: redirect leak → {trace['leak']}")
+            raw.append({"method": "TRACE", "leak": trace.get("leak")})
+        else:
+            r_trace = trace.get("response")
+            if r_trace:
+                raw.append({"method": "TRACE", "status": r_trace.status_code, "allow": r_trace.headers.get("Allow", "")})
+                if r_trace.status_code not in (400, 401, 403, 404, 405, 501):
+                    found.append(f"TRACE: unexpected HTTP {r_trace.status_code}")
+
+        if found:
+            risk = "high" if any(x.startswith(("PUT:", "DELETE:", "PROPFIND:", "MKCOL:")) for x in found) else "medium"
+            return finding(name, "warn", risk, found, raw=raw, finding_type="exposure")
+        if allow_methods:
+            return finding(name, "info", "low", f"Allowed methods: {', '.join(sorted(allow_methods))}", raw=raw)
+        return finding(name, "info", "info", "No risky HTTP methods detected", raw=raw)
+    except Exception as e:
+        return error_finding(name, e)
+
+def check_directory_listing(url: str) -> dict[str, Any]:
+    name = "Directory listing"
+    try:
+        base = url.rstrip("/")
+        hits = []
+        raw = []
+        baseline = get_soft404_baseline(base)
+
+        for path in DIRECTORY_LISTING_PATHS:
+            target = f"{base}{path}" if path.startswith("/") else f"{base}/{path}"
+            res = fetch_with_policy(target)
+            if res.get("leak"):
+                hits.append(f"{path} redirect leak → {res['leak']}")
+                raw.append({"path": path, "leak": res.get("leak")})
+                continue
+            r = res.get("response")
+            if not r or r.status_code != 200 or looks_like_soft404(r, baseline):
+                continue
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            text = r.text or ""
+            if ("html" in ct or "text/plain" in ct or not ct) and DIRECTORY_LISTING_RE.search(text):
+                hits.append(f"{path} looks like directory listing")
+                raw.append({"path": path, "status": r.status_code, "content_type": ct, "sample": text[:160]})
+
+        if hits:
+            return finding(name, "warn", "high", hits, raw=raw, finding_type="exposure")
+        return finding(name, "info", "info", "No directory listing detected")
+    except Exception as e:
+        return error_finding(name, e)
+
+
+def _collect_js_sources_from_html(base_url: str, html: str) -> tuple[list[str], list[str]]:
+    parser = html_extract(html or "")
+    script_urls = []
+    for src in parser.script_srcs:
+        full = _resolve_literal_url(base_url, src)
+        if full:
+            script_urls.append(full)
+
+    inline_scripts = []
+    for m in re.finditer(r"<script(?:\s[^>]*)?>([\s\S]*?)</script>", html or "", re.IGNORECASE):
+        body = m.group(1) or ""
+        if body.strip():
+            inline_scripts.append(body[:JS_SCAN_MAX_BYTES])
+
+    return sorted(set(script_urls)), inline_scripts[:JS_SCAN_MAX_FILES]
+
+
+def _analyze_js_text(base_url: str, source_name: str, text: str) -> dict[str, Any]:
+    urls = []
+    for m in URL_LITERAL_RE.finditer(text or ""):
+        full = _resolve_literal_url(base_url, m.group("url"))
+        if full:
+            urls.append(full)
+
+    clearnet_urls = sorted(set(u for u in urls if _is_clearnet(u)))
+    onion_urls = sorted(set(u for u in urls if _is_onion(u) and not same_onion_host(base_url, u)))
+    ips = sorted(set(ip for ip in IPV4_RE.findall(text or "") if is_valid_ipv4(ip)))
+
+    secret_hits = []
+    for pname, rx in SECRET_PATTERNS.items():
+        if pname == "url":
+            continue
+        for hit in rx.findall(text or ""):
+            val = hit if isinstance(hit, str) else " ".join(hit)
+            val = str(val)
+            secret_hits.append({"type": pname, "match": val[:120]})
+            if len(secret_hits) >= 20:
+                break
+        if len(secret_hits) >= 20:
+            break
+
+    source_maps = []
+    for m in SOURCE_MAP_RE.finditer(text or ""):
+        sm = (m.group(1) or "").strip().strip('"\'')
+        if sm:
+            source_maps.append(sm)
+
+    return {
+        "source": source_name,
+        "clearnet_urls": clearnet_urls[:80],
+        "cross_onion_urls": onion_urls[:40],
+        "ips": ips[:40],
+        "secret_candidates": secret_hits[:20],
+        "source_maps": sorted(set(source_maps))[:20],
+    }
+
+
+def check_js_leaks(url: str) -> dict[str, Any]:
+    name = "JavaScript leaks"
+    try:
+        res = fetch_with_policy(url)
+        if res.get("leak"):
+            return finding(name, "fail", "high", f"Redirect leak → {res['leak']}", raw=res, finding_type="deanon")
+        r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
+
+        script_urls, inline_scripts = _collect_js_sources_from_html(url, r.text or "")
+        analyses = []
+
+        for idx, body in enumerate(inline_scripts, start=1):
+            analyses.append(_analyze_js_text(url, f"inline-script-{idx}", body))
+
+        fetched_js = 0
+        source_map_hits = []
+        for script_url in script_urls[:JS_SCAN_MAX_FILES]:
+            if _is_clearnet(script_url):
+                analyses.append({"source": script_url, "clearnet_urls": [script_url], "cross_onion_urls": [], "ips": [], "secret_candidates": [], "source_maps": []})
+                continue
+            if not same_onion_host(url, script_url):
+                analyses.append({"source": script_url, "clearnet_urls": [], "cross_onion_urls": [script_url], "ips": [], "secret_candidates": [], "source_maps": []})
+                continue
+            js_res = fetch_with_policy(script_url)
+            if js_res.get("leak"):
+                analyses.append({"source": script_url, "clearnet_urls": [js_res["leak"]], "cross_onion_urls": [], "ips": [], "secret_candidates": [], "source_maps": []})
+                continue
+            jr = js_res.get("response")
+            if not jr or jr.status_code != 200 or not (jr.content or b""):
+                continue
+            if len(jr.content or b"") > JS_SCAN_MAX_BYTES:
+                text = (jr.content or b"")[:JS_SCAN_MAX_BYTES].decode("utf-8", errors="ignore")
+            else:
+                text = jr.text or ""
+            analysis = _analyze_js_text(url, script_url, text)
+            analyses.append(analysis)
+            fetched_js += 1
+
+            for sm in analysis.get("source_maps", []):
+                full = _resolve_literal_url(script_url, sm)
+                if not full:
+                    continue
+                if _is_clearnet(full):
+                    source_map_hits.append(f"clearnet source map reference: {full}")
+                    continue
+                if not same_onion_host(url, full):
+                    source_map_hits.append(f"cross-onion source map reference: {full}")
+                    continue
+                sm_res = fetch_with_policy(full)
+                sr = sm_res.get("response")
+                if sr and sr.status_code == 200 and sr.content:
+                    source_map_hits.append(f"accessible source map: {full}")
+
+        clearnet = sorted(set(u for a in analyses for u in a.get("clearnet_urls", [])))
+        cross_onion = sorted(set(u for a in analyses for u in a.get("cross_onion_urls", [])))
+        ips = sorted(set(ip for a in analyses for ip in a.get("ips", [])))
+        secrets = [s for a in analyses for s in a.get("secret_candidates", [])]
+
+        evidence = {
+            "scripts_seen": len(script_urls),
+            "scripts_fetched": fetched_js,
+            "clearnet_urls": clearnet[:100],
+            "cross_onion_urls": cross_onion[:60],
+            "ips": ips[:60],
+            "secret_candidates": secrets[:30],
+            "source_map_findings": sorted(set(source_map_hits))[:50],
+        }
+
+        if secrets:
+            return finding(name, "warn", "high", evidence, raw=analyses, finding_type="leak")
+        if clearnet or cross_onion or ips or source_map_hits:
+            return finding(name, "warn", "medium", evidence, raw=analyses, finding_type="leak")
+        return finding(name, "info", "info", f"No obvious JS leaks detected ({len(script_urls)} script srcs, {len(inline_scripts)} inline blocks)", raw=evidence)
+    except Exception as e:
+        return error_finding(name, e)
+
+
+def _image_metadata_hits(raw: bytes) -> dict[str, Any]:
+    markers = []
+    for marker in IMAGE_METADATA_MARKERS:
+        if marker.lower() in (raw or b"").lower():
+            try:
+                markers.append(marker.decode("ascii", errors="ignore"))
+            except Exception:
+                markers.append(repr(marker))
+
+    decoded = (raw or b"")[:IMAGE_METADATA_MAX_BYTES].decode("latin-1", errors="ignore")
+    urls = sorted(set(re.findall(r'https?://[^\s\'"<>\x00]{4,160}', decoded, re.IGNORECASE)))
+    ips = sorted(set(ip for ip in IPV4_RE.findall(decoded) if is_valid_ipv4(ip)))
+    gps = any(x.lower().startswith("gps") or "gps" in x.lower() for x in markers)
+    return {"markers": sorted(set(markers)), "urls": urls[:30], "ips": ips[:30], "gps_hint": gps}
+
+
+def check_image_metadata(url: str) -> dict[str, Any]:
+    name = "Image metadata"
+    try:
+        res = fetch_with_policy(url)
+        if res.get("leak"):
+            return finding(name, "fail", "high", f"Redirect leak → {res['leak']}", raw=res, finding_type="deanon")
+        r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
+        parser = html_extract(r.text or "")
+        images = []
+        for src in parser.img_srcs:
+            full = _resolve_literal_url(url, src)
+            if not full:
+                continue
+            if _is_clearnet(full):
+                images.append({"url": full, "issue": "clearnet image resource"})
+                continue
+            if not same_onion_host(url, full):
+                images.append({"url": full, "issue": "cross-onion image resource"})
+                continue
+            if not IMAGE_EXT_RE.search(urlparse(full).path or ""):
+                continue
+            images.append({"url": full})
+
+        hits = []
+        raw_hits = []
+        checked = 0
+        for item in images[:IMAGE_METADATA_MAX_IMAGES]:
+            full = item["url"]
+            if item.get("issue"):
+                hits.append(f"{full}: {item['issue']}")
+                raw_hits.append(item)
+                continue
+            img_res = fetch_with_policy(full)
+            ir = img_res.get("response")
+            if not ir or ir.status_code != 200 or not ir.content:
+                continue
+            checked += 1
+            raw = (ir.content or b"")[:IMAGE_METADATA_MAX_BYTES]
+            meta = _image_metadata_hits(raw)
+            if meta["markers"] or meta["urls"] or meta["ips"]:
+                hits.append(f"{full}: metadata markers={meta['markers'][:8]}, urls={len(meta['urls'])}, ips={len(meta['ips'])}")
+                raw_hits.append({"url": full, **meta})
+
+        if raw_hits:
+            risk = "high" if any(x.get("gps_hint") or x.get("ips") for x in raw_hits if isinstance(x, dict)) else "medium"
+            return finding(name, "warn", risk, hits, raw={"checked": checked, "hits": raw_hits}, finding_type="leak")
+        return finding(name, "info", "info", f"No obvious image metadata leaks detected (checked={checked})")
+    except Exception as e:
+        return error_finding(name, e)
 
 
 def check_external_resources(url: str) -> dict[str, Any]:
@@ -1152,17 +1547,31 @@ def check_protocol_relative_links(url: str) -> dict[str, Any]:
 def check_cors(url: str) -> dict[str, Any]:
     name = "CORS headers"
     try:
-        res = fetch_with_policy(url)
-        if res.get("leak"):
-            return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
-        r = res.get("response")
+        r = request("GET", url, allow_redirects=False, headers={"Origin": CORS_PROBE_ORIGIN})
         ac = {k: v for k, v in (r.headers.items() if r else []) if k.lower().startswith("access-control-")}
-        if ac:
-            return finding(name, "info", "low", [f"{k}: {v}" for k, v in ac.items()], raw=ac)
-        return finding(name, "info", "info", "No CORS headers")
+        if not ac:
+            return finding(name, "info", "info", "No CORS headers")
+
+        acao = ac.get("Access-Control-Allow-Origin") or ac.get("access-control-allow-origin") or ""
+        acac = ac.get("Access-Control-Allow-Credentials") or ac.get("access-control-allow-credentials") or ""
+        issues = []
+        if acao == "*":
+            issues.append("Access-Control-Allow-Origin is wildcard (*)")
+        if acao.lower() == CORS_PROBE_ORIGIN:
+            issues.append("Access-Control-Allow-Origin reflects arbitrary Origin")
+        if acac.lower() == "true" and (acao == "*" or acao.lower() == CORS_PROBE_ORIGIN):
+            issues.append("Credentialed CORS appears permissive or reflected")
+        if acao and _is_clearnet(acao):
+            issues.append(f"Clearnet origin allowed: {acao}")
+
+        evidence = {"headers": ac, "issues": issues}
+        if any("Credentialed" in x or "reflects" in x for x in issues):
+            return finding(name, "warn", "high", evidence, raw=evidence, finding_type="policy")
+        if issues:
+            return finding(name, "warn", "medium", evidence, raw=evidence, finding_type="policy")
+        return finding(name, "info", "low", evidence, raw=evidence)
     except Exception as e:
         return error_finding(name, e)
-
 
 def check_meta_redirects(url: str) -> dict[str, Any]:
     name = "Meta-refresh"
@@ -1187,10 +1596,13 @@ def check_robots_sitemap(url: str) -> dict[str, Any]:
     try:
         base = url.rstrip("/")
         out = []
+        leaks = []
+        raw = []
         for path in ("/robots.txt", "/sitemap.xml"):
             res = fetch_with_policy(f"{base}{path}")
             if res.get("leak"):
-                out.append(f"{path} redirect leak \u2192 {res['leak']}")
+                leaks.append(f"{path} redirect leak → {res['leak']}")
+                raw.append({"path": path, "leak": res.get("leak")})
                 continue
             r = res.get("response")
             if not r or r.status_code != 200 or not (r.content or b""):
@@ -1199,20 +1611,31 @@ def check_robots_sitemap(url: str) -> dict[str, Any]:
             if _looks_like_html(r.content or b"", ct):
                 continue
             text = r.text or ""
+            urls = sorted(set(_resolve_literal_url(base, u) for u in re.findall(r"https?://[^\s<>\"']+", text, re.IGNORECASE)))
+            urls = [u for u in urls if u]
+            clear_urls = [u for u in urls if _is_clearnet(u)]
+            cross_onion_urls = [u for u in urls if _is_onion(u) and not same_onion_host(base, u)]
+            if clear_urls:
+                leaks.append(f"{path} clearnet URLs: " + " | ".join(clear_urls[:20]))
+            if cross_onion_urls:
+                leaks.append(f"{path} cross-onion URLs: " + " | ".join(cross_onion_urls[:20]))
             if path.endswith("robots.txt"):
-                lines = [l for l in text.splitlines() if l.lower().startswith(("disallow:", "sitemap:"))]
+                lines = [l for l in text.splitlines() if l.lower().startswith(("disallow:", "allow:", "sitemap:"))]
                 if lines:
-                    out.append("/robots.txt entries:\n" + "\n".join(lines))
+                    out.append("/robots.txt entries:\n" + "\n".join(lines[:100]))
+                    raw.append({"path": path, "lines": lines[:100], "clearnet_urls": clear_urls, "cross_onion_urls": cross_onion_urls})
             else:
                 locs = re.findall(r"<loc>([^<]+)</loc>", text, re.IGNORECASE)
                 if locs:
                     out.append("/sitemap.xml locs:\n" + "\n".join(locs[:100]))
+                    raw.append({"path": path, "locs": locs[:100], "clearnet_urls": clear_urls, "cross_onion_urls": cross_onion_urls})
+        if leaks:
+            return finding(name, "warn", "high", leaks + out, raw=raw, finding_type="deanon")
         if out:
-            return finding(name, "info", "low", out)
+            return finding(name, "info", "low", out, raw=raw)
         return finding(name, "info", "info", "No robots.txt or sitemap.xml entries found")
     except Exception as e:
         return error_finding(name, e)
-
 
 def check_form_actions(url: str) -> dict[str, Any]:
     name = "Form actions"
@@ -1276,6 +1699,49 @@ def _looks_like_security_txt(body_text: str) -> bool:
     return first_ok and has_contact and has_expires
 
 
+def _parse_securitytxt_directives(body_text: str) -> dict[str, list[str]]:
+    directives: dict[str, list[str]] = {}
+    for raw_line in (body_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        directives.setdefault(key, []).append(val)
+    return directives
+
+
+def _securitytxt_analysis(body_text: str) -> dict[str, Any]:
+    directives = _parse_securitytxt_directives(body_text)
+    issues = []
+    leaks = []
+
+    expires_values = directives.get("expires", [])
+    if expires_values:
+        try:
+            exp = parsedate_to_datetime(expires_values[0])
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= datetime.now(timezone.utc):
+                issues.append(f"Expires is in the past: {expires_values[0]}")
+        except Exception:
+            issues.append(f"Expires is not a valid RFC-style date: {expires_values[0]}")
+
+    for key in ("contact", "encryption", "acknowledgments", "policy", "canonical", "hiring"):
+        for val in directives.get(key, []):
+            for match in URL_LITERAL_RE.finditer(val):
+                full = _resolve_literal_url("http://placeholder.onion", match.group("url"))
+                if full and _is_clearnet(full):
+                    leaks.append(f"{key}: {full}")
+
+    canonical_values = directives.get("canonical", [])
+    if canonical_values and not any("/.well-known/security.txt" in c for c in canonical_values):
+        issues.append("Canonical does not point to /.well-known/security.txt")
+
+    return {"directives": directives, "issues": issues, "clearnet_urls": sorted(set(leaks))}
+
+
 def _securitytxt_invalid_reason(r) -> Optional[str]:
     if not r:
         return "no response"
@@ -1300,7 +1766,7 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
     try:
         res = fetch_with_policy(f"{base_url.rstrip('/')}{path}")
         if res.get("leak"):
-            return finding(name, "fail", "high", f"{path}: redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
+            return finding(name, "fail", "high", f"{path}: redirect leak → {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
         if not r:
             return finding(name, "warn", "low", f"{path}: no response")
@@ -1311,11 +1777,18 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
             ct = r.headers.get("Content-Type", "") or "n/a"
             sample = (r.text or "")[:120].replace("\n", " ").strip()
             return finding(name, "warn", "medium", f"{path}: HTTP 200 but NOT valid security.txt ({reason}); Content-Type={ct}; sample='{sample}'")
+
         lines = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        return finding(name, "ok", "low", lines[:12], raw={"path": path})
+        analysis = _securitytxt_analysis(r.text or "")
+        evidence = {"path": path, "lines": lines[:20], **analysis}
+
+        if analysis["clearnet_urls"]:
+            return finding(name, "warn", "medium", evidence, raw=evidence, finding_type="leak")
+        if analysis["issues"]:
+            return finding(name, "warn", "low", evidence, raw=evidence, finding_type="policy")
+        return finding(name, "ok", "low", lines[:12], raw=evidence)
     except Exception as e:
         return error_finding(name, e)
-
 
 def check_captcha_leak(url: str) -> dict[str, Any]:
     name = "CAPTCHA leak"
@@ -1344,14 +1817,29 @@ def check_captcha_leak(url: str) -> dict[str, Any]:
 def check_onion_location(url: str) -> dict[str, Any]:
     name = "Onion-Location header"
     try:
+        target_host = (urlparse(url).hostname or "").lower()
+
+        if cfg.clearnet_url:
+            r = request("GET", cfg.clearnet_url, allow_redirects=False, verify=not cfg.insecure_https, send_cookie=False)
+            val = r.headers.get("Onion-Location") or r.headers.get("onion-location")
+            if not val:
+                return finding(name, "info", "info", f"No Onion-Location header on clearnet URL ({cfg.clearnet_url})", raw={"clearnet_url": cfg.clearnet_url, "status_code": r.status_code})
+            resolved = urljoin(cfg.clearnet_url, val)
+            onion_host = (urlparse(resolved).hostname or "").lower()
+            evidence = {"clearnet_url": cfg.clearnet_url, "header": val, "resolved": resolved, "target_host": target_host}
+            if onion_host == target_host:
+                return finding(name, "ok", "low", f"Clearnet Onion-Location points to target onion: {resolved}", raw=evidence)
+            if onion_host.endswith(".onion"):
+                return finding(name, "warn", "medium", f"Clearnet Onion-Location points to a different onion: {resolved}", raw=evidence, finding_type="policy")
+            return finding(name, "warn", "medium", f"Clearnet Onion-Location is not a valid onion URL: {resolved}", raw=evidence, finding_type="policy")
+
         r = request("GET", url, allow_redirects=False)
         val = r.headers.get("Onion-Location") or r.headers.get("onion-location")
         if val:
-            return finding(name, "ok", "low", f"Onion-Location: {val}", raw={"value": val})
+            return finding(name, "info", "low", f"Onion-Location on onion origin: {val}", raw={"value": val, "note": "This header is mainly useful on a clearnet HTTPS mirror."})
         return finding(name, "info", "info", "No Onion-Location header")
     except Exception as e:
         return error_finding(name, e)
-
 
 def check_header_leaks(url: str) -> dict[str, Any]:
     name = "Header leaks"
@@ -1921,8 +2409,6 @@ def run_step(idx: int, total: int, desc: str, fn, json_mode: bool) -> dict[str, 
         except Exception as e:
             return error_finding(desc, e)
 
-    # Only the live status line is shown while the check is running.
-    # After the context exits, Rich clears it and we print one final complete line.
     with console.status(f"[bright_blue]{idx}/{total} running: {desc}[/bright_blue]", spinner="dots"):
         try:
             out = fn()
@@ -1970,6 +2456,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-tor-check", action="store_true", help="do not call check.torproject.org")
     parser.add_argument("--json", action="store_true", help="output JSON instead of a table")
     parser.add_argument("--cookie", help="raw Cookie header, e.g. 'a=b; c=d'")
+    parser.add_argument("--clearnet-url", help="optional clearnet mirror URL for Onion-Location validation")
     parser.add_argument("-o", "--output", help="write report to file (JSON if --json, else TXT)")
     parser.add_argument("--insecure-https", action="store_true", help="disable TLS verification for HTTPS HTTP requests")
     parser.add_argument("--scheme", choices=["auto", "http", "https"], default="auto", help="origin scheme mode (default: auto)")
@@ -2000,6 +2487,11 @@ def main() -> None:
     cfg.scheme = args.scheme
     cfg.retries = max(0, args.retries)
     cfg.workers = max(1, args.workers)
+    if args.clearnet_url:
+        clearnet_url = args.clearnet_url.strip()
+        if not clearnet_url.startswith(("http://", "https://")):
+            clearnet_url = "https://" + clearnet_url
+        cfg.clearnet_url = clearnet_url.rstrip("/")
 
     socks_host, socks_port = parse_socks(args.socks)
     cfg.socks_host, cfg.socks_port = socks_host, socks_port
@@ -2057,10 +2549,13 @@ def main() -> None:
         ("ETag header", lambda: check_etag(base_url)),
         ("Onion-Location header", lambda: check_onion_location(base_url)),
         ("Header leaks", lambda: check_header_leaks(base_url)),
+        ("Security headers", lambda: check_security_headers(base_url)),
         ("SSH fingerprint", lambda: check_ssh_fingerprint(base_url, args.ssh_port)),
         ("Comments in code", lambda: check_comments(base_url)),
         ("Status pages", lambda: check_status_pages(base_url)),
+        ("HTTP methods", lambda: check_http_methods(base_url)),
         ("Files & paths", lambda: check_files_and_paths(base_url)),
+        ("Directory listing", lambda: check_directory_listing(base_url)),
         ("Well-known endpoints", lambda: check_well_known(base_url)),
         ("External resources", lambda: check_external_resources(base_url)),
         ("Protocol-relative links", lambda: check_protocol_relative_links(base_url)),
@@ -2069,6 +2564,8 @@ def main() -> None:
         ("Robots & sitemap", lambda: check_robots_sitemap(base_url)),
         ("Form actions", lambda: check_form_actions(base_url)),
         ("WebSocket endpoints", lambda: check_websocket_endpoints(base_url)),
+        ("JavaScript leaks", lambda: check_js_leaks(base_url)),
+        ("Image metadata", lambda: check_image_metadata(base_url)),
         ("Proxy headers", lambda: check_proxy_headers(base_url)),
         ("security.txt (root)", lambda: _fetch_security_txt(base_url, "/security.txt")),
         ("security.txt (.well-known)", lambda: _fetch_security_txt(base_url, "/.well-known/security.txt")),
@@ -2089,7 +2586,7 @@ def main() -> None:
 
     payload = {
         "tool": "onionscout",
-        "version": "0.1.5",
+        "version": "0.2.0",
         "target": base_url,
         "config": {
             "http_timeout": cfg.http_timeout,
@@ -2105,6 +2602,7 @@ def main() -> None:
             "retries": cfg.retries,
             "workers": cfg.workers,
             "cookie_scoped_to_target": bool(cfg.cookie_header),
+            "clearnet_url": cfg.clearnet_url,
             "html_parser": "selectolax" if SelectolaxHTMLParser is not None else "stdlib",
             "origin_selection": origin_info,
         },

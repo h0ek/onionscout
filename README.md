@@ -43,8 +43,13 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - clearnet form actions
 - clearnet WebSocket endpoints
 - Onion-Location header
+- optional clearnet mirror Onion-Location validation with `--clearnet-url`
 - proxy-related headers
 - common fingerprinting headers
+- baseline security headers
+- CORS misconfiguration classification
+- JavaScript URL, IP, source-map, and secret-candidate leak checks
+- lightweight image metadata sniffing for EXIF/XMP-style markers, URLs, IPs, and GPS hints
 
 ### Hidden-service hygiene checks
 
@@ -52,11 +57,15 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - Apache `mod_info`
 - nginx `stub_status`
 - WebDAV exposure
+- HTTP method exposure checks, including TRACE, PUT, DELETE, PATCH, PROPFIND, and MKCOL
 - common sensitive files and paths
+- directory listing detection
 - `.well-known/*` endpoints
 - `robots.txt`
 - `sitemap.xml`
+- clearnet URL detection inside `robots.txt` and `sitemap.xml`
 - `security.txt` at root and `.well-known`
+- basic `security.txt` Expires, Canonical, and clearnet URL review
 - CAPTCHA-related external resource leakage
 - Set-Cookie attributes:
   - Secure
@@ -143,6 +152,12 @@ Force HTTPS:
 onionscout -u exampleonionaddress.onion --scheme https --insecure-https
 ```
 
+Validate a clearnet mirror `Onion-Location` header against the target onion:
+
+```
+onionscout -u exampleonionaddress.onion --clearnet-url https://mirror.example
+```
+
 Save TXT report:
 
 ```
@@ -213,6 +228,7 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 --ssh-port            SSH port for fingerprint check
 --retries             Retries for transient onion/Tor errors
 --cookie              Raw HTTP Cookie header, e.g. 'access=VALUE; session=VALUE2'
+--clearnet-url        Optional clearnet mirror URL for Onion-Location validation
 --insecure-https      Disable HTTPS certificate verification for HTTP requests
 --no-crawl            Disable crawler-based checks
 --max-urls            Crawler URL limit
