@@ -38,6 +38,8 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - CSP / CSP-Report-Only external allowances
 - Report-To / NEL / Link header leakage
 - canonical / alternate / OpenGraph / Twitter metadata leaks
+- RSS / Atom feed metadata leak checks
+- JSON-LD structured data URL leak checks
 - protocol-relative external links
 - meta-refresh redirects
 - clearnet form actions
@@ -50,6 +52,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - CORS misconfiguration classification
 - JavaScript URL, IP, source-map, and secret-candidate leak checks
 - lightweight image metadata sniffing for EXIF/XMP-style markers, URLs, IPs, and GPS hints
+- linked document metadata sniffing for authors, tool names, paths, IPs, emails, and clearnet URLs
 
 ### Hidden-service hygiene checks
 
@@ -59,7 +62,9 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - WebDAV exposure
 - HTTP method exposure checks, including TRACE, PUT, DELETE, PATCH, PROPFIND, and MKCOL
 - common sensitive files and paths
+- backup, archive, SQL dump, and stale file leak detection
 - directory listing detection
+- verbose error-page fingerprinting
 - `.well-known/*` endpoints
 - `robots.txt`
 - `sitemap.xml`
@@ -88,6 +93,9 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - human-readable Rich table
 - JSON output for automation
 - optional report file export
+- standalone HTML report export
+- check profiles: basic, safe, extended
+- check selection with `--only` and `--skip`
 
 ## Requirements
 
@@ -170,6 +178,32 @@ Save JSON report:
 onionscout -u exampleonionaddress.onion --json -o report.json
 ```
 
+Save HTML report:
+
+```
+onionscout -u exampleonionaddress.onion --html-report report.html
+```
+
+Use a specific profile:
+
+```
+onionscout -u exampleonionaddress.onion --profile basic
+onionscout -u exampleonionaddress.onion --profile safe
+onionscout -u exampleonionaddress.onion --profile extended
+```
+
+Run only selected checks:
+
+```
+onionscout -u exampleonionaddress.onion --only headers,js,robots,metadata
+```
+
+Skip selected checks:
+
+```
+onionscout -u exampleonionaddress.onion --skip ssh,images,crawl
+```
+
 Disable crawler:
 
 ```
@@ -227,6 +261,9 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 --tls-timeout         TLS timeout
 --ssh-port            SSH port for fingerprint check
 --retries             Retries for transient onion/Tor errors
+--profile             Check profile: basic, safe, extended
+--only                Run only selected checks
+--skip                Skip selected checks
 --cookie              Raw HTTP Cookie header, e.g. 'access=VALUE; session=VALUE2'
 --clearnet-url        Optional clearnet mirror URL for Onion-Location validation
 --insecure-https      Disable HTTPS certificate verification for HTTP requests
@@ -234,6 +271,7 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 --max-urls            Crawler URL limit
 --depth               Crawler depth
 --json                Output JSON
+--html-report         Save standalone HTML report
 -o, --output          Save report to file
 ```
 
@@ -243,3 +281,5 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 - In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
 - Redirects are followed only when they stay on the selected target onion host; clearnet and cross-onion redirects are reported instead of being fetched.
 - Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
+- `basic` is for quick low-noise checks, `safe` is the default, and `extended` increases selected metadata/archive review limits.
+- `--only` and `--skip` accept check names or short aliases such as `headers`, `js`, `robots`, `metadata`, `docs`, `backup`, and `errors`.

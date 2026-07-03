@@ -15,6 +15,7 @@ import uuid
 import ssl
 import base64
 import hashlib
+from html import escape
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
@@ -52,12 +53,14 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.2.0
+v0.3.0
 """
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
 SECURITYTXT_MAX_BYTES = 200_000
+DOCUMENT_METADATA_MAX_BYTES = 1_500_000
+HTML_REPORT_MAX_RAW_CHARS = 20_000
 CORS_PROBE_ORIGIN = "http://corsprobeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"
 
 
@@ -79,6 +82,7 @@ class Config:
     cookie_header: Optional[str] = None
     target_host: str = ""
     clearnet_url: Optional[str] = None
+    profile: str = "safe"
 
 
 cfg = Config()
@@ -337,6 +341,100 @@ IMAGE_METADATA_MARKERS = [
     b"Software", b"CreatorTool", b"ImageDescription", b"Artist", b"Copyright",
     b"Adobe", b"Photoshop", b"GIMP", b"Lightroom", b"Make", b"Model", b"xmpmeta",
 ]
+
+DOCUMENT_EXT_RE = re.compile(r"\.(?:pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|zip)(?:$|[?#])", re.IGNORECASE)
+DOCUMENT_METADATA_RE = re.compile(
+    r"(?i)(?:Author|Creator|Producer|Company|LastModifiedBy|Manager|Template|Application|CreationDate|ModDate|dc:creator|cp:lastModifiedBy)\s*[:=>\"']{1,6}\s*([^<\r\n\x00]{1,120})"
+)
+WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\(?:[^\\\r\n\x00<>:\"|?*]{1,80}\\){1,8}[^\\\r\n\x00<>:\"|?*]{1,120}")
+LINUX_PATH_RE = re.compile(r"/(?:home|var|srv|opt|etc|usr/local|app|www)/(?:[^\s\r\n\x00<>\"']{1,80}/){0,8}[^\s\r\n\x00<>\"']{1,120}")
+
+BACKUP_ARCHIVE_PATHS_SAFE = [
+    "/backup.zip", "/backup.tar", "/backup.tar.gz", "/backup.tgz", "/backups.zip", "/site.zip",
+    "/site.tar.gz", "/www.zip", "/www.tar.gz", "/public.zip", "/public_html.zip", "/html.zip",
+    "/app.zip", "/source.zip", "/src.zip", "/db.sql", "/database.sql", "/dump.sql", "/prod.sql",
+    "/backup.sql", "/database.sqlite", "/db.sqlite", "/config.php.bak", "/index.php.bak", "/.env.bak",
+]
+BACKUP_ARCHIVE_PATHS_EXTENDED = BACKUP_ARCHIVE_PATHS_SAFE + [
+    "/old.zip", "/old.tar.gz", "/new.zip", "/latest.zip", "/release.zip", "/deploy.zip", "/htdocs.zip",
+    "/web.zip", "/root.zip", "/var_www.zip", "/wwwroot.zip", "/mysql.sql", "/postgres.sql",
+    "/users.sql", "/data.sql", "/app.sql", "/config.php~", "/index.php~", "/settings.php.bak",
+]
+ERROR_PAGE_PATTERNS = [
+    ("Django debug page", re.compile(r"Django(?: version)? .*?Exception Type:|Traceback .*?Django", re.IGNORECASE | re.DOTALL)),
+    ("Werkzeug debugger", re.compile(r"Werkzeug Debugger|Traceback \(most recent call last\).*?werkzeug", re.IGNORECASE | re.DOTALL)),
+    ("Laravel debug page", re.compile(r"Whoops!|Laravel.*?(?:Stack trace|Exception)", re.IGNORECASE | re.DOTALL)),
+    ("Symfony debug page", re.compile(r"Symfony.*?Exception|Stack Trace.*?Symfony", re.IGNORECASE | re.DOTALL)),
+    ("Rails error page", re.compile(r"Ruby on Rails|Action Controller: Exception caught|ActiveRecord::", re.IGNORECASE)),
+    ("Express stack trace", re.compile(r"Error: .*?\n\s+at .*?\(.*?\.js:\d+:\d+\)", re.IGNORECASE | re.DOTALL)),
+    ("PHP warning/error", re.compile(r"(?:PHP )?(?:Fatal error|Warning|Notice|Parse error):", re.IGNORECASE)),
+    ("Java stack trace", re.compile(r"(?:java\.|javax\.|org\.apache\.).*?Exception", re.IGNORECASE | re.DOTALL)),
+    ("Tomcat error page", re.compile(r"Apache Tomcat/|HTTP Status \d{3} –", re.IGNORECASE)),
+    ("nginx default error page", re.compile(r"<center>nginx(?:/[^<]+)?</center>", re.IGNORECASE)),
+    ("Apache default error page", re.compile(r"Apache(?:/[^\s<]+)? Server at .*? Port \d+", re.IGNORECASE | re.DOTALL)),
+]
+
+CHECK_KEY_ALIASES = {
+    "target": "target-onion",
+    "tor": "tor",
+    "origin": "origin-selection",
+    "availability": "http-availability",
+    "server": "detect-server",
+    "tls": "https-tls",
+    "headers": "security-headers",
+    "security": "security-headers",
+    "methods": "http-methods",
+    "files": "files-paths",
+    "paths": "files-paths",
+    "backup": "backup-archives",
+    "backups": "backup-archives",
+    "archives": "backup-archives",
+    "listing": "directory-listing",
+    "robots": "robots-sitemap",
+    "sitemap": "robots-sitemap",
+    "forms": "form-actions",
+    "websocket": "websockets",
+    "websockets": "websockets",
+    "javascript": "js-leaks",
+    "js": "js-leaks",
+    "images": "image-metadata",
+    "image": "image-metadata",
+    "documents": "document-metadata",
+    "docs": "document-metadata",
+    "metadata": "metadata-leaks",
+    "og": "metadata-leaks",
+    "rss": "metadata-leaks",
+    "jsonld": "metadata-leaks",
+    "json-ld": "metadata-leaks",
+    "cookies": "set-cookie",
+    "cookie": "cookie-provided",
+    "securitytxt": "securitytxt-well-known",
+    "security.txt": "securitytxt-well-known",
+    "errors": "error-pages",
+    "error-pages": "error-pages",
+}
+
+BASIC_CHECK_KEYS = {
+    "tor", "cookie-provided", "target-onion", "origin-selection", "http-availability", "detect-server",
+    "https-tls", "onion-location", "header-leaks", "security-headers", "cors", "robots-sitemap",
+    "securitytxt-well-known", "csp-related", "metadata-leaks", "set-cookie",
+}
+
+SAFE_CHECK_KEYS = {
+    "tor", "cookie-provided", "target-onion", "origin-selection", "http-availability", "detect-server",
+    "https-tls", "favicon", "favicon-html", "etag", "onion-location", "header-leaks", "security-headers",
+    "ssh", "comments", "status-pages", "http-methods", "files-paths", "backup-archives",
+    "directory-listing", "well-known", "external-resources", "protocol-relative", "cors", "meta-refresh",
+    "robots-sitemap", "form-actions", "websockets", "js-leaks", "image-metadata", "proxy-headers",
+    "securitytxt-root", "securitytxt-well-known", "captcha", "csp-related", "metadata-leaks",
+    "set-cookie", "error-pages", "crawl", "document-metadata", "indicators",
+}
+
+PROFILE_CHECK_KEYS = {
+    "basic": BASIC_CHECK_KEYS,
+    "safe": SAFE_CHECK_KEYS,
+    "extended": SAFE_CHECK_KEYS,
+}
 
 
 def normalize_url(raw: str) -> str:
@@ -644,11 +742,26 @@ def fetch_with_policy(
     return {"response": None, "leak": None, "redirect_chain": visited, "final_url": current, "error": "too many redirects", "error_kind": "redirect_loop"}
 
 
+def group_for_finding_type(finding_type: str) -> str:
+    return {
+        "deanon": "de-anonymization",
+        "dependency": "external dependency",
+        "external_links": "external link",
+        "exposure": "exposure",
+        "leak": "metadata leak",
+        "network": "network",
+        "policy": "web hygiene",
+        "internal": "internal",
+        "info": "general",
+    }.get((finding_type or "info").lower(), "general")
+
+
 def finding(name: str, status: str, risk: str, evidence: Any, raw: Any = None, finding_type: str = "info") -> dict[str, Any]:
     return {
         "name": name,
         "status": status,
         "finding_type": finding_type,
+        "group": group_for_finding_type(finding_type),
         "risk": risk,
         "evidence": evidence,
         "raw": raw,
@@ -1712,21 +1825,47 @@ def _parse_securitytxt_directives(body_text: str) -> dict[str, list[str]]:
     return directives
 
 
-def _securitytxt_analysis(body_text: str) -> dict[str, Any]:
+def _parse_securitytxt_expires(value: str) -> Optional[datetime]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    if raw.endswith("Z"):
+        candidates.append(raw[:-1] + "+00:00")
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _securitytxt_analysis(body_text: str, path: str = "") -> dict[str, Any]:
     directives = _parse_securitytxt_directives(body_text)
     issues = []
     leaks = []
 
+    if "contact" not in directives:
+        issues.append("Contact directive missing")
+    if "expires" not in directives:
+        issues.append("Expires directive missing")
+
     expires_values = directives.get("expires", [])
     if expires_values:
-        try:
-            exp = parsedate_to_datetime(expires_values[0])
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            if exp <= datetime.now(timezone.utc):
-                issues.append(f"Expires is in the past: {expires_values[0]}")
-        except Exception:
-            issues.append(f"Expires is not a valid RFC-style date: {expires_values[0]}")
+        exp = _parse_securitytxt_expires(expires_values[0])
+        if not exp:
+            issues.append(f"Expires is not a valid date: {expires_values[0]}")
+        elif exp <= datetime.now(timezone.utc):
+            issues.append(f"Expires is in the past: {expires_values[0]}")
 
     for key in ("contact", "encryption", "acknowledgments", "policy", "canonical", "hiring"):
         for val in directives.get(key, []):
@@ -1736,10 +1875,20 @@ def _securitytxt_analysis(body_text: str) -> dict[str, Any]:
                     leaks.append(f"{key}: {full}")
 
     canonical_values = directives.get("canonical", [])
-    if canonical_values and not any("/.well-known/security.txt" in c for c in canonical_values):
-        issues.append("Canonical does not point to /.well-known/security.txt")
+    if canonical_values:
+        for c in canonical_values:
+            c = c.strip()
+            if not c.startswith(("http://", "https://")):
+                issues.append(f"Canonical is not an absolute URL: {c}")
+            if "/.well-known/security.txt" not in c:
+                issues.append(f"Canonical does not point to /.well-known/security.txt: {c}")
+    elif path == "/.well-known/security.txt":
+        issues.append("Canonical directive missing")
 
-    return {"directives": directives, "issues": issues, "clearnet_urls": sorted(set(leaks))}
+    if path == "/security.txt":
+        issues.append("Root /security.txt is legacy compatibility; prefer /.well-known/security.txt")
+
+    return {"directives": directives, "issues": sorted(set(issues)), "clearnet_urls": sorted(set(leaks))}
 
 
 def _securitytxt_invalid_reason(r) -> Optional[str]:
@@ -1753,11 +1902,15 @@ def _securitytxt_invalid_reason(r) -> Optional[str]:
         return f"too large ({len(raw)} bytes)"
     if _looks_like_html(raw, ct):
         return f"looks like HTML (Content-Type={ct or 'n/a'})"
-    if ct and not (ct.startswith("text/") or "text" in ct or "charset=" in ct or "octet-stream" in ct):
+    if ct and not (ct.startswith("text/plain") or ct.startswith("text/security") or "charset=" in ct or "octet-stream" in ct):
         return f"suspicious Content-Type ({ct})"
     text = (r.text or "").strip()
     if not _looks_like_security_txt(text):
-        return "missing required directives (need at least Contact and Expires)"
+        directives = _parse_securitytxt_directives(text)
+        if not directives:
+            return "no security.txt directives found"
+        if "contact" not in directives or "expires" not in directives:
+            return "missing required directives (need at least Contact and Expires)"
     return None
 
 
@@ -1779,7 +1932,7 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
             return finding(name, "warn", "medium", f"{path}: HTTP 200 but NOT valid security.txt ({reason}); Content-Type={ct}; sample='{sample}'")
 
         lines = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        analysis = _securitytxt_analysis(r.text or "")
+        analysis = _securitytxt_analysis(r.text or "", path)
         evidence = {"path": path, "lines": lines[:20], **analysis}
 
         if analysis["clearnet_urls"]:
@@ -2030,8 +2183,26 @@ def check_csp_related(url: str) -> dict[str, Any]:
         return error_finding(name, e)
 
 
+def _json_ld_blocks(html: str) -> list[str]:
+    blocks = []
+    for m in re.finditer(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>([\s\S]*?)</script>", html or "", re.IGNORECASE):
+        body = (m.group(1) or "").strip()
+        if body:
+            blocks.append(body[:JS_SCAN_MAX_BYTES])
+    return blocks[:10]
+
+
+def _urls_from_json_like_text(base_url: str, text: str) -> list[str]:
+    urls = []
+    for m in URL_LITERAL_RE.finditer(text or ""):
+        full = _resolve_literal_url(base_url, m.group("url"))
+        if full:
+            urls.append(full)
+    return sorted(set(urls))
+
+
 def check_meta_and_link_leaks(url: str) -> dict[str, Any]:
-    name = "Canonical / alternate / OG / Twitter / preload"
+    name = "Canonical / OG / RSS / JSON-LD leaks"
     try:
         res = fetch_with_policy(url)
         if res.get("leak"):
@@ -2039,24 +2210,40 @@ def check_meta_and_link_leaks(url: str) -> dict[str, Any]:
         r = res.get("response")
         if not r:
             return no_response_finding(name, res)
-        p = html_extract(r.text or "")
+        body = r.text or ""
+        p = html_extract(body)
+        rss_candidates = []
+        for rel, href in p.link_hrefs:
+            if "alternate" in rel or "feed" in rel:
+                full = _resolve_literal_url(url, href)
+                if full:
+                    rss_candidates.append(full)
         buckets = {
             "canonical": _resolve_candidates(url, p.canonical_urls),
             "alternate": _resolve_candidates(url, p.alternate_urls),
+            "rss_atom": rss_candidates,
             "preconnect": _resolve_candidates(url, p.preconnect_urls),
             "prefetch": _resolve_candidates(url, p.prefetch_urls),
             "preload": _resolve_candidates(url, p.preload_urls),
             "og": _resolve_candidates(url, p.og_urls),
             "twitter": _resolve_candidates(url, p.twitter_urls),
+            "json_ld": [u for block in _json_ld_blocks(body) for u in _urls_from_json_like_text(url, block)],
         }
         hits = []
+        raw = {}
         for k, vals in buckets.items():
+            vals = sorted(set(vals))
             clear = [v for v in vals if _is_clearnet(v)]
+            cross_onion = [v for v in vals if _is_onion(v) and not same_onion_host(url, v)]
+            if vals:
+                raw[k] = {"all": vals[:80], "clearnet": clear[:40], "cross_onion": cross_onion[:40]}
             if clear:
-                hits.append(f"{k}: " + " | ".join(clear[:20]))
+                hits.append(f"{k} clearnet: " + " | ".join(clear[:20]))
+            if cross_onion:
+                hits.append(f"{k} cross-onion: " + " | ".join(cross_onion[:20]))
         if hits:
-            return finding(name, "warn", "high", hits, finding_type="deanon")
-        return finding(name, "info", "info", "No clearnet leaks in canonical/alternate/OG/Twitter/pre* metadata")
+            return finding(name, "warn", "high", hits, raw=raw, finding_type="deanon")
+        return finding(name, "info", "info", "No clearnet or cross-onion leaks in canonical/OG/RSS/JSON-LD metadata", raw=raw)
     except Exception as e:
         return error_finding(name, e)
 
@@ -2104,6 +2291,205 @@ def analyze_set_cookie(url: str) -> dict[str, Any]:
     except Exception as e:
         return error_finding(name, e)
 
+
+
+def _backup_paths_for_profile() -> list[str]:
+    if cfg.profile == "extended":
+        return BACKUP_ARCHIVE_PATHS_EXTENDED
+    return BACKUP_ARCHIVE_PATHS_SAFE
+
+
+def check_backup_archives(url: str) -> dict[str, Any]:
+    name = "Backup/archive leaks"
+    try:
+        base = url.rstrip("/")
+        baseline = get_soft404_baseline(base)
+        hits = []
+        raw = []
+        for path in _backup_paths_for_profile():
+            target = f"{base}{path}"
+            res = fetch_with_policy(target, method="HEAD")
+            if res.get("leak"):
+                hits.append(f"{path} redirect leak \u2192 {res['leak']}")
+                raw.append({"path": path, "leak": res.get("leak")})
+                continue
+            r = res.get("response")
+            if not r or r.status_code in (404, 405):
+                res = fetch_with_policy(target)
+                if res.get("leak"):
+                    hits.append(f"{path} redirect leak \u2192 {res['leak']}")
+                    raw.append({"path": path, "leak": res.get("leak")})
+                    continue
+                r = res.get("response")
+            if not r:
+                continue
+            if r.status_code in (401, 403):
+                raw.append({"path": path, "status": r.status_code, "protected": True})
+                continue
+            if r.status_code != 200:
+                continue
+            size = int(r.headers.get("Content-Length") or len(r.content or b"") or 0)
+            if size and size > DOCUMENT_METADATA_MAX_BYTES * 50:
+                hits.append(f"{path} large backup-like candidate (HTTP 200, {size} bytes, not downloaded)")
+                raw.append({"path": path, "status": r.status_code, "size": size, "skipped": "too large"})
+                continue
+            if not (r.content or b""):
+                res = fetch_with_policy(target)
+                if res.get("leak"):
+                    hits.append(f"{path} redirect leak \u2192 {res['leak']}")
+                    raw.append({"path": path, "leak": res.get("leak")})
+                    continue
+                r = res.get("response")
+                if not r or r.status_code != 200:
+                    continue
+            if looks_like_soft404(r, baseline):
+                continue
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            size = int(r.headers.get("Content-Length") or len(r.content or b"") or 0)
+            if _looks_like_html(r.content or b"", ct) and not re.search(r"\.(?:sql|sqlite|bak|zip|tar|tgz|gz)(?:$|[?#])", path, re.IGNORECASE):
+                continue
+            hits.append(f"{path} found (HTTP 200, {size or 'unknown'} bytes, ct={ct or 'n/a'})")
+            raw.append({"path": path, "status": r.status_code, "content_type": ct, "size": size})
+        if hits:
+            return finding(name, "warn", "high", hits[:80], raw={"count": len(hits), "items": raw}, finding_type="exposure")
+        return finding(name, "info", "info", "No backup/archive files detected", raw={"checked": len(_backup_paths_for_profile())})
+    except Exception as e:
+        return error_finding(name, e)
+
+
+def _document_scan_limit() -> int:
+    return 12 if cfg.profile == "extended" else 6
+
+
+def _collect_document_links(base_url: str, page_urls: list[str]) -> tuple[list[str], list[str]]:
+    docs = set()
+    external = set()
+    pages = [base_url] + [u for u in page_urls if same_onion_host(base_url, u)]
+    for page_url in pages[:25]:
+        try:
+            res = fetch_with_policy(page_url)
+            r = res.get("response")
+            if not r or r.status_code != 200:
+                continue
+            ct = (r.headers.get("Content-Type", "") or "").lower()
+            if "html" not in ct and "xhtml" not in ct:
+                continue
+            parser = html_extract(r.text or "")
+            candidates = parser.anchor_hrefs + [href for _, href in parser.link_hrefs]
+            for href in candidates:
+                full = _resolve_literal_url(page_url, href)
+                if not full:
+                    continue
+                if not DOCUMENT_EXT_RE.search(urlparse(full).path or full):
+                    continue
+                if _is_clearnet(full) or (_is_onion(full) and not same_onion_host(base_url, full)):
+                    external.add(full)
+                elif same_onion_host(base_url, full):
+                    docs.add(full)
+        except Exception:
+            continue
+    return sorted(docs), sorted(external)
+
+
+def _document_metadata_hits(raw: bytes) -> dict[str, Any]:
+    blob = (raw or b"")[:DOCUMENT_METADATA_MAX_BYTES]
+    text = blob.decode("latin-1", errors="ignore")
+    urls = sorted(set(u for u in re.findall(r"https?://[^\s'\"<>\x00]{4,180}", text, re.IGNORECASE) if _is_clearnet(u)))
+    onions = sorted(set(u for u in re.findall(r"https?://[^\s'\"<>\x00]*\.onion[^\s'\"<>\x00]{0,120}", text, re.IGNORECASE)))
+    ips = sorted(set(ip for ip in IPV4_RE.findall(text) if is_valid_ipv4(ip)))
+    emails = sorted(set(EMAIL_RE.findall(text)))
+    metadata = []
+    for m in DOCUMENT_METADATA_RE.finditer(text):
+        label = m.group(0).strip()
+        label = re.sub(r"\s+", " ", label)
+        metadata.append(label[:180])
+    windows_paths = sorted(set(WINDOWS_PATH_RE.findall(text)))[:20]
+    linux_paths = sorted(set(LINUX_PATH_RE.findall(text)))[:20]
+    return {
+        "metadata": sorted(set(metadata))[:40],
+        "clearnet_urls": urls[:40],
+        "onion_urls": onions[:40],
+        "ips": ips[:40],
+        "emails": emails[:40],
+        "windows_paths": windows_paths,
+        "linux_paths": linux_paths,
+    }
+
+
+def check_document_metadata(url: str, crawled_urls: list[str]) -> dict[str, Any]:
+    name = "Document metadata"
+    try:
+        docs, external = _collect_document_links(url, crawled_urls)
+        hits = []
+        raw_hits = []
+        skipped = []
+        checked = 0
+        for ext in external[:30]:
+            hits.append(f"external document link: {ext}")
+            raw_hits.append({"url": ext, "issue": "external document link"})
+        for doc_url in docs[:_document_scan_limit()]:
+            head = fetch_with_policy(doc_url, method="HEAD")
+            hr = head.get("response")
+            if hr:
+                size = int(hr.headers.get("Content-Length") or 0)
+                if size and size > DOCUMENT_METADATA_MAX_BYTES * 4:
+                    skipped.append({"url": doc_url, "skipped": "too large", "size": size})
+                    continue
+            res = fetch_with_policy(doc_url)
+            if res.get("leak"):
+                hits.append(f"{doc_url}: redirect leak \u2192 {res['leak']}")
+                raw_hits.append({"url": doc_url, "leak": res.get("leak")})
+                continue
+            r = res.get("response")
+            if not r or r.status_code != 200 or not r.content:
+                continue
+            checked += 1
+            meta = _document_metadata_hits(r.content)
+            interesting = any(meta[k] for k in ("metadata", "clearnet_urls", "ips", "emails", "windows_paths", "linux_paths"))
+            if interesting:
+                summary = []
+                for key in ("metadata", "clearnet_urls", "ips", "emails", "windows_paths", "linux_paths"):
+                    if meta[key]:
+                        summary.append(f"{key}={len(meta[key])}")
+                hits.append(f"{doc_url}: " + ", ".join(summary))
+                raw_hits.append({"url": doc_url, **meta})
+        if raw_hits:
+            high = any(x.get("clearnet_urls") or x.get("ips") or x.get("windows_paths") or x.get("linux_paths") for x in raw_hits if isinstance(x, dict))
+            return finding(name, "warn", "high" if high else "medium", hits[:80] or raw_hits[:20], raw={"checked": checked, "document_links": docs[:80], "external_links": external[:80], "skipped": skipped, "hits": raw_hits}, finding_type="leak")
+        return finding(name, "info", "info", f"No document metadata leaks detected (links={len(docs)}, checked={checked})", raw={"document_links": docs[:80], "external_links": external[:80], "skipped": skipped})
+    except Exception as e:
+        return error_finding(name, e)
+
+
+def check_error_page_fingerprints(url: str) -> dict[str, Any]:
+    name = "Error page fingerprints"
+    try:
+        base = url.rstrip("/")
+        target = f"{base}/onionscout-{uuid.uuid4().hex}"
+        home_fp = _get_home_fingerprint(base)
+        res = fetch_with_policy(target)
+        if res.get("leak"):
+            return finding(name, "fail", "high", f"Error page redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
+        r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
+        ct = (r.headers.get("Content-Type", "") or "").lower()
+        text = r.text or ""
+        if r.status_code == 200 and "html" in ct and home_fp and _hash_html(text) == home_fp:
+            return finding(name, "info", "info", "Random path returned homepage-like content")
+        hits = []
+        for label, rx in ERROR_PAGE_PATTERNS:
+            if rx.search(text):
+                hits.append(label)
+        trace_paths = sorted(set(WINDOWS_PATH_RE.findall(text) + LINUX_PATH_RE.findall(text)))[:20]
+        ips = sorted(set(ip for ip in IPV4_RE.findall(text) if is_valid_ipv4(ip)))[:20]
+        evidence = {"status_code": r.status_code, "fingerprints": hits, "paths": trace_paths, "ips": ips, "sample": text[:240].replace("\n", " ").strip()}
+        if hits or trace_paths or ips:
+            risk = "high" if trace_paths or ips or any("debug" in x.lower() or "trace" in x.lower() for x in hits) else "medium"
+            return finding(name, "warn", risk, evidence, raw=evidence, finding_type="leak")
+        return finding(name, "info", "info", f"No verbose error page fingerprint detected (HTTP {r.status_code})", raw=evidence)
+    except Exception as e:
+        return error_finding(name, e)
 
 
 def normalize_obfuscated_email(value: str) -> Optional[str]:
@@ -2331,6 +2717,138 @@ def indicator_finding(urls: list[str]) -> dict[str, Any]:
         return error_finding(name, e)
 
 
+def _split_csv_values(value: Optional[str]) -> set[str]:
+    if not value:
+        return set()
+    out = set()
+    for chunk in re.split(r"[,\s]+", value.strip()):
+        item = chunk.strip().lower()
+        if item:
+            out.add(CHECK_KEY_ALIASES.get(item, item))
+    return out
+
+
+def filter_tasks(tasks: list[dict[str, Any]], profile: str, only_value: Optional[str], skip_value: Optional[str]) -> list[dict[str, Any]]:
+    profile_keys = PROFILE_CHECK_KEYS.get(profile, SAFE_CHECK_KEYS)
+    only = _split_csv_values(only_value)
+    skip = _split_csv_values(skip_value)
+    selected = []
+    available = {t["key"] for t in tasks}
+    if only:
+        wanted = only & available
+    else:
+        wanted = set(profile_keys) & available
+    for task in tasks:
+        key = task["key"]
+        if key in wanted and key not in skip:
+            selected.append(task)
+    return selected
+
+
+def result_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    by_status: dict[str, int] = {}
+    by_risk: dict[str, int] = {}
+    by_group: dict[str, int] = {}
+    high_signal = []
+    for item in results:
+        status = str(item.get("status", "info"))
+        risk = str(item.get("risk", "info"))
+        group = str(item.get("group") or group_for_finding_type(item.get("finding_type", "info")))
+        by_status[status] = by_status.get(status, 0) + 1
+        by_risk[risk] = by_risk.get(risk, 0) + 1
+        by_group[group] = by_group.get(group, 0) + 1
+        if status in {"warn", "fail"} and risk in {"medium", "high", "critical"}:
+            high_signal.append({
+                "name": item.get("name"),
+                "status": status,
+                "risk": risk,
+                "group": group,
+                "evidence": item.get("evidence"),
+            })
+    return {
+        "by_status": dict(sorted(by_status.items())),
+        "by_risk": dict(sorted(by_risk.items())),
+        "by_group": dict(sorted(by_group.items())),
+        "high_signal": high_signal[:20],
+    }
+
+
+def _html_value(value: Any) -> str:
+    safe = make_json_safe(value)
+    if isinstance(safe, (dict, list)):
+        text = json.dumps(safe, ensure_ascii=False, indent=2)
+    else:
+        text = str(safe)
+    if len(text) > HTML_REPORT_MAX_RAW_CHARS:
+        text = text[:HTML_REPORT_MAX_RAW_CHARS] + "\n...truncated..."
+    return escape(text)
+
+
+def render_html_report(target_url: str, results: list[dict[str, Any]], payload: dict[str, Any]) -> str:
+    summary = result_summary(results)
+    rows = []
+    for item in results:
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(item.get('name', '')))}</td>"
+            f"<td class='status-{escape(str(item.get('status', 'info')))}'>{escape(str(item.get('status', 'info')))}</td>"
+            f"<td class='risk-{escape(str(item.get('risk', 'info')))}'>{escape(str(item.get('risk', 'info')))}</td>"
+            f"<td>{escape(str(item.get('group') or group_for_finding_type(item.get('finding_type', 'info'))))}</td>"
+            f"<td><pre>{_html_value(item.get('evidence'))}</pre></td>"
+            "</tr>"
+        )
+    cards = []
+    for title, data in (("Status", summary["by_status"]), ("Risk", summary["by_risk"]), ("Group", summary["by_group"])):
+        inner = "".join(f"<div><strong>{escape(str(k))}</strong>: {escape(str(v))}</div>" for k, v in data.items())
+        cards.append(f"<section class='card'><h2>{escape(title)}</h2>{inner or '<div>n/a</div>'}</section>")
+    top = "".join(
+        f"<li><strong>{escape(str(x.get('risk')))}</strong> {escape(str(x.get('name')))} <span>{escape(str(x.get('group')))}</span></li>"
+        for x in summary["high_signal"]
+    ) or "<li>No medium/high signal findings.</li>"
+    generated = datetime.now(timezone.utc).isoformat()
+    return f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onionscout report</title>
+<style>
+body{{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#101114;color:#e8e8e8;margin:0;padding:24px;}}
+main{{max-width:1200px;margin:0 auto;}}
+h1{{margin-bottom:4px;}}
+.meta{{color:#aaa;margin-bottom:20px;}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:20px 0;}}
+.card{{background:#181a20;border:1px solid #30333d;border-radius:12px;padding:14px;}}
+table{{width:100%;border-collapse:collapse;background:#181a20;border:1px solid #30333d;border-radius:12px;overflow:hidden;}}
+th,td{{border-bottom:1px solid #30333d;padding:10px;text-align:left;vertical-align:top;}}
+th{{background:#20232b;}}
+pre{{white-space:pre-wrap;word-break:break-word;margin:0;max-width:640px;}}
+.status-ok,.risk-info{{color:#7bd88f;}}
+.status-info,.risk-low{{color:#8cc7ff;}}
+.status-warn,.risk-medium{{color:#ffd166;}}
+.status-fail,.status-error,.risk-high,.risk-critical{{color:#ff6b6b;}}
+ul{{background:#181a20;border:1px solid #30333d;border-radius:12px;padding:14px 14px 14px 34px;}}
+span{{color:#aaa;}}
+</style>
+</head>
+<body>
+<main>
+<h1>onionscout report</h1>
+<div class="meta">Target: {escape(target_url)} · Generated: {escape(generated)} · Version: {escape(str(payload.get('version', 'n/a')))}</div>
+<div class="grid">{''.join(cards)}</div>
+<h2>Top signal</h2>
+<ul>{top}</ul>
+<h2>Findings</h2>
+<table>
+<thead><tr><th>Check</th><th>Status</th><th>Risk</th><th>Group</th><th>Evidence</th></tr></thead>
+<tbody>{''.join(rows)}</tbody>
+</table>
+</main>
+</body>
+</html>
+'''
+
+
 def render_text_evidence(ev: Any) -> str:
     if isinstance(ev, list):
         return " | ".join(str(x) for x in ev)
@@ -2455,6 +2973,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port for fingerprint check (default: 22)")
     parser.add_argument("--skip-tor-check", action="store_true", help="do not call check.torproject.org")
     parser.add_argument("--json", action="store_true", help="output JSON instead of a table")
+    parser.add_argument("--html-report", help="write an HTML report to file")
+    parser.add_argument("--profile", choices=["basic", "safe", "extended"], default="safe", help="check profile (default: safe)")
+    parser.add_argument("--only", help="run only selected checks, comma-separated, e.g. headers,js,robots")
+    parser.add_argument("--skip", help="skip selected checks, comma-separated, e.g. ssh,images,crawl")
     parser.add_argument("--cookie", help="raw Cookie header, e.g. 'a=b; c=d'")
     parser.add_argument("--clearnet-url", help="optional clearnet mirror URL for Onion-Location validation")
     parser.add_argument("-o", "--output", help="write report to file (JSON if --json, else TXT)")
@@ -2487,6 +3009,7 @@ def main() -> None:
     cfg.scheme = args.scheme
     cfg.retries = max(0, args.retries)
     cfg.workers = max(1, args.workers)
+    cfg.profile = args.profile
     if args.clearnet_url:
         clearnet_url = args.clearnet_url.strip()
         if not clearnet_url.startswith(("http://", "https://")):
@@ -2527,66 +3050,76 @@ def main() -> None:
     def run_indicator_step() -> dict[str, Any]:
         return indicator_finding(crawled_urls)
 
-    tasks: list[tuple[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
 
     if not args.skip_tor_check:
-        tasks.append(("SOCKS/Tor connectivity check", lambda: check_tor_proxy()))
+        tasks.append({"key": "tor", "name": "SOCKS/Tor connectivity check", "fn": lambda: check_tor_proxy()})
     else:
-        tasks.append((
-            "SOCKS/Tor connectivity check",
-            lambda: finding("SOCKS/Tor connectivity check", "info", "info", "Skipped (--skip-tor-check)")
-        ))
+        tasks.append({
+            "key": "tor",
+            "name": "SOCKS/Tor connectivity check",
+            "fn": lambda: finding("SOCKS/Tor connectivity check", "info", "info", "Skipped (--skip-tor-check)"),
+        })
 
     tasks += [
-        ("Cookie provided", lambda: check_cookie_present(args.cookie)),
-        ("Target onion address", lambda: check_target_onion_address(base_url)),
-        ("Origin selection", lambda: finding("Origin selection", "info", "info", origin_info)),
-        ("HTTP origin availability", lambda: check_http_availability(base_url)),
-        ("Detect server", lambda: detect_server(base_url)),
-        ("HTTPS/TLS sanity", lambda: check_https_tls(base_url)),
-        ("Detect favicon", lambda: check_favicon(base_url)),
-        ("Favicon in HTML", lambda: check_favicon_in_html(base_url)),
-        ("ETag header", lambda: check_etag(base_url)),
-        ("Onion-Location header", lambda: check_onion_location(base_url)),
-        ("Header leaks", lambda: check_header_leaks(base_url)),
-        ("Security headers", lambda: check_security_headers(base_url)),
-        ("SSH fingerprint", lambda: check_ssh_fingerprint(base_url, args.ssh_port)),
-        ("Comments in code", lambda: check_comments(base_url)),
-        ("Status pages", lambda: check_status_pages(base_url)),
-        ("HTTP methods", lambda: check_http_methods(base_url)),
-        ("Files & paths", lambda: check_files_and_paths(base_url)),
-        ("Directory listing", lambda: check_directory_listing(base_url)),
-        ("Well-known endpoints", lambda: check_well_known(base_url)),
-        ("External resources", lambda: check_external_resources(base_url)),
-        ("Protocol-relative links", lambda: check_protocol_relative_links(base_url)),
-        ("CORS headers", lambda: check_cors(base_url)),
-        ("Meta-refresh", lambda: check_meta_redirects(base_url)),
-        ("Robots & sitemap", lambda: check_robots_sitemap(base_url)),
-        ("Form actions", lambda: check_form_actions(base_url)),
-        ("WebSocket endpoints", lambda: check_websocket_endpoints(base_url)),
-        ("JavaScript leaks", lambda: check_js_leaks(base_url)),
-        ("Image metadata", lambda: check_image_metadata(base_url)),
-        ("Proxy headers", lambda: check_proxy_headers(base_url)),
-        ("security.txt (root)", lambda: _fetch_security_txt(base_url, "/security.txt")),
-        ("security.txt (.well-known)", lambda: _fetch_security_txt(base_url, "/.well-known/security.txt")),
-        ("CAPTCHA leak", lambda: check_captcha_leak(base_url)),
-        ("CSP / Report-To / NEL / Link", lambda: check_csp_related(base_url)),
-        ("Canonical / alternate / OG / Twitter / preload", lambda: check_meta_and_link_leaks(base_url)),
-        ("Set-Cookie analysis", lambda: analyze_set_cookie(base_url)),
-        ("Crawl links", run_crawl_step),
-        ("Indicators (emails/crypto)", run_indicator_step),
+        {"key": "cookie-provided", "name": "Cookie provided", "fn": lambda: check_cookie_present(args.cookie)},
+        {"key": "target-onion", "name": "Target onion address", "fn": lambda: check_target_onion_address(base_url)},
+        {"key": "origin-selection", "name": "Origin selection", "fn": lambda: finding("Origin selection", "info", "info", origin_info)},
+        {"key": "http-availability", "name": "HTTP origin availability", "fn": lambda: check_http_availability(base_url)},
+        {"key": "detect-server", "name": "Detect server", "fn": lambda: detect_server(base_url)},
+        {"key": "https-tls", "name": "HTTPS/TLS sanity", "fn": lambda: check_https_tls(base_url)},
+        {"key": "favicon", "name": "Detect favicon", "fn": lambda: check_favicon(base_url)},
+        {"key": "favicon-html", "name": "Favicon in HTML", "fn": lambda: check_favicon_in_html(base_url)},
+        {"key": "etag", "name": "ETag header", "fn": lambda: check_etag(base_url)},
+        {"key": "onion-location", "name": "Onion-Location header", "fn": lambda: check_onion_location(base_url)},
+        {"key": "header-leaks", "name": "Header leaks", "fn": lambda: check_header_leaks(base_url)},
+        {"key": "security-headers", "name": "Security headers", "fn": lambda: check_security_headers(base_url)},
+        {"key": "ssh", "name": "SSH fingerprint", "fn": lambda: check_ssh_fingerprint(base_url, args.ssh_port)},
+        {"key": "comments", "name": "Comments in code", "fn": lambda: check_comments(base_url)},
+        {"key": "status-pages", "name": "Status pages", "fn": lambda: check_status_pages(base_url)},
+        {"key": "http-methods", "name": "HTTP methods", "fn": lambda: check_http_methods(base_url)},
+        {"key": "files-paths", "name": "Files & paths", "fn": lambda: check_files_and_paths(base_url)},
+        {"key": "backup-archives", "name": "Backup/archive leaks", "fn": lambda: check_backup_archives(base_url)},
+        {"key": "directory-listing", "name": "Directory listing", "fn": lambda: check_directory_listing(base_url)},
+        {"key": "well-known", "name": "Well-known endpoints", "fn": lambda: check_well_known(base_url)},
+        {"key": "external-resources", "name": "External resources", "fn": lambda: check_external_resources(base_url)},
+        {"key": "protocol-relative", "name": "Protocol-relative links", "fn": lambda: check_protocol_relative_links(base_url)},
+        {"key": "cors", "name": "CORS headers", "fn": lambda: check_cors(base_url)},
+        {"key": "meta-refresh", "name": "Meta-refresh", "fn": lambda: check_meta_redirects(base_url)},
+        {"key": "robots-sitemap", "name": "Robots & sitemap", "fn": lambda: check_robots_sitemap(base_url)},
+        {"key": "form-actions", "name": "Form actions", "fn": lambda: check_form_actions(base_url)},
+        {"key": "websockets", "name": "WebSocket endpoints", "fn": lambda: check_websocket_endpoints(base_url)},
+        {"key": "js-leaks", "name": "JavaScript leaks", "fn": lambda: check_js_leaks(base_url)},
+        {"key": "image-metadata", "name": "Image metadata", "fn": lambda: check_image_metadata(base_url)},
+        {"key": "proxy-headers", "name": "Proxy headers", "fn": lambda: check_proxy_headers(base_url)},
+        {"key": "securitytxt-root", "name": "security.txt (root)", "fn": lambda: _fetch_security_txt(base_url, "/security.txt")},
+        {"key": "securitytxt-well-known", "name": "security.txt (.well-known)", "fn": lambda: _fetch_security_txt(base_url, "/.well-known/security.txt")},
+        {"key": "captcha", "name": "CAPTCHA leak", "fn": lambda: check_captcha_leak(base_url)},
+        {"key": "csp-related", "name": "CSP / Report-To / NEL / Link", "fn": lambda: check_csp_related(base_url)},
+        {"key": "metadata-leaks", "name": "Canonical / OG / RSS / JSON-LD leaks", "fn": lambda: check_meta_and_link_leaks(base_url)},
+        {"key": "set-cookie", "name": "Set-Cookie analysis", "fn": lambda: analyze_set_cookie(base_url)},
+        {"key": "error-pages", "name": "Error page fingerprints", "fn": lambda: check_error_page_fingerprints(base_url)},
+        {"key": "crawl", "name": "Crawl links", "fn": run_crawl_step},
+        {"key": "document-metadata", "name": "Document metadata", "fn": lambda: check_document_metadata(base_url, crawled_urls)},
+        {"key": "indicators", "name": "Indicators (emails/crypto)", "fn": run_indicator_step},
     ]
+
+    tasks = filter_tasks(tasks, args.profile, args.only, args.skip)
+    if not tasks:
+        console.print(ASCII_LOGO)
+        console.print("[red]Error: no checks selected after applying --profile/--only/--skip[/red]")
+        sys.exit(2)
 
     total = len(tasks)
     results = []
 
-    for idx, (desc, fn) in enumerate(tasks, start=1):
-        out = run_step(idx, total, desc, fn, args.json)
+    for idx, task in enumerate(tasks, start=1):
+        out = run_step(idx, total, task["name"], task["fn"], args.json)
         results.append(out)
 
     payload = {
         "tool": "onionscout",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "target": base_url,
         "config": {
             "http_timeout": cfg.http_timeout,
@@ -2601,11 +3134,15 @@ def main() -> None:
             "scheme": cfg.scheme,
             "retries": cfg.retries,
             "workers": cfg.workers,
+            "profile": cfg.profile,
+            "only": args.only,
+            "skip": args.skip,
             "cookie_scoped_to_target": bool(cfg.cookie_header),
             "clearnet_url": cfg.clearnet_url,
             "html_parser": "selectolax" if SelectolaxHTMLParser is not None else "stdlib",
             "origin_selection": origin_info,
         },
+        "summary": result_summary(results),
         "results": results,
     }
 
@@ -2616,6 +3153,10 @@ def main() -> None:
                 f.write(out_json + "\n")
         else:
             print(out_json)
+        if args.html_report:
+            html = render_html_report(base_url, results, payload)
+            with open(args.html_report, "w", encoding="utf-8") as f:
+                f.write(html)
         return
 
     console.print("\n[bold green]All steps complete[/bold green]\n")
@@ -2624,6 +3165,7 @@ def main() -> None:
     table.add_column("Status")
     table.add_column("Risk")
     table.add_column("Type")
+    table.add_column("Group")
     table.add_column("Evidence")
     for item in results:
         table.add_row(
@@ -2631,15 +3173,25 @@ def main() -> None:
             status_cell(item["status"]),
             risk_cell(item["risk"]),
             type_cell(item["finding_type"]),
+            str(item.get("group") or group_for_finding_type(item.get("finding_type", "info"))),
             render_text_evidence(item["evidence"]),
         )
     console.print(table)
 
     if args.output:
-        txt = render_txt_report(base_url, results)
+        if args.output.lower().endswith((".html", ".htm")):
+            txt = render_html_report(base_url, results, payload)
+        else:
+            txt = render_txt_report(base_url, results)
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(txt)
         console.print(f"\n[cyan]Saved report to: {args.output}[/cyan]")
+
+    if args.html_report:
+        html = render_html_report(base_url, results, payload)
+        with open(args.html_report, "w", encoding="utf-8") as f:
+            f.write(html)
+        console.print(f"[cyan]Saved HTML report to: {args.html_report}[/cyan]")
 
 
 if __name__ == "__main__":
