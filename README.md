@@ -28,7 +28,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - default error-page fingerprinting
 - favicon discovery and Shodan-compatible favicon hash
 - ETag extraction and Shodan query helper
-- TLS reachability, TLS version, cipher, certificate SHA256, issuer, subject, and validity
+- TLS reachability, TLS version, cipher, certificate SHA256, issuer, subject, validity, and self-signed/self-issued certificate detection
 
 ### Leak and de-anonymization checks
 
@@ -157,6 +157,14 @@ onionscout -u exampleonionaddress.onion --scheme http
 Force HTTPS:
 
 ```
+onionscout -u exampleonionaddress.onion --scheme https
+```
+
+Self-signed target onion certificates are detected automatically and HTTPS verification is disabled only for target HTTP checks. Use `--no-auto-insecure-https` to keep strict verification behavior.
+
+Manual insecure HTTPS mode is still available:
+
+```
 onionscout -u exampleonionaddress.onion --scheme https --insecure-https
 ```
 
@@ -267,6 +275,8 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 --cookie              Raw HTTP Cookie header, e.g. 'access=VALUE; session=VALUE2'
 --clearnet-url        Optional clearnet mirror URL for Onion-Location validation
 --insecure-https      Disable HTTPS certificate verification for HTTP requests
+--no-auto-insecure-https
+                       Keep strict verification even for self-signed target onion certificates
 --no-crawl            Disable crawler-based checks
 --max-urls            Crawler URL limit
 --depth               Crawler depth

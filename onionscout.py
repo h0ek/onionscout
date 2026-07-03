@@ -53,7 +53,7 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.3.0
+v0.3.1
 """
 
 console = Console()
@@ -73,6 +73,8 @@ class Config:
     socks_host: str = "127.0.0.1"
     socks_port: int = 9050
     insecure_https: bool = False
+    auto_insecure_https: bool = True
+    auto_insecure_https_reason: Optional[str] = None
     no_crawl: bool = False
     crawl_max_urls: int = 80
     crawl_depth: int = 1
@@ -615,6 +617,27 @@ def is_target_onion_url(url: str) -> bool:
     return p.scheme in {"http", "https"} and host.endswith(".onion") and bool(cfg.target_host and host == cfg.target_host)
 
 
+def _tls_auto_insecure_reason(error: Exception) -> Optional[str]:
+    text = str(error).lower()
+    if "self-signed" in text or "self signed" in text:
+        return "self-signed certificate"
+    if "certificate verify failed" in text and ("unable to get local issuer" in text or "unable to verify" in text or "unknown ca" in text):
+        return "untrusted certificate chain"
+    return None
+
+
+def enable_auto_insecure_https(url: str, reason: str) -> bool:
+    if not cfg.auto_insecure_https or cfg.insecure_https:
+        return False
+    p = urlparse(url)
+    if p.scheme != "https" or not is_target_onion_url(url):
+        return False
+    cfg.insecure_https = True
+    cfg.auto_insecure_https_reason = reason
+    urllib3.disable_warnings(InsecureRequestWarning)
+    return True
+
+
 def request(
     method: str,
     url: str,
@@ -639,6 +662,16 @@ def request(
 
     for attempt in range(attempts):
         try:
+            if verify is False:
+                with _WarningsSilenced():
+                    return session.request(
+                        method,
+                        url,
+                        timeout=timeout,
+                        allow_redirects=allow_redirects,
+                        verify=verify,
+                        headers=req_headers or None,
+                    )
             return session.request(
                 method,
                 url,
@@ -647,6 +680,16 @@ def request(
                 verify=verify,
                 headers=req_headers or None,
             )
+        except SSLError as e:
+            reason = _tls_auto_insecure_reason(e)
+            if verify and reason and enable_auto_insecure_https(url, reason):
+                verify = False
+                continue
+            info = classify_network_error(e)
+            last_error = e
+            if attempt >= attempts - 1 or not should_retry_error(info["kind"]):
+                raise
+            time.sleep(min(0.35 * (attempt + 1), 1.5))
         except Exception as e:
             info = classify_network_error(e)
             last_error = e
@@ -2087,11 +2130,13 @@ def check_https_tls(url: str) -> dict[str, Any]:
                 not_before = cert.not_valid_before_utc.isoformat() if hasattr(cert, "not_valid_before_utc") else str(cert.not_valid_before)
                 not_after = cert.not_valid_after_utc.isoformat() if hasattr(cert, "not_valid_after_utc") else str(cert.not_valid_after)
 
+                self_issued = bool(subject and issuer and subject == issuer)
                 raw_out.update({
                     "subject": subject,
                     "issuer": issuer,
                     "not_before": not_before,
                     "not_after": not_after,
+                    "self_issued": self_issued,
                 })
 
                 evidence += [
@@ -2099,10 +2144,19 @@ def check_https_tls(url: str) -> dict[str, Any]:
                     f"Issuer: {issuer}",
                     f"Valid: {not_before} -> {not_after}",
                 ]
+
+                if self_issued:
+                    evidence.append("Certificate appears self-signed/self-issued")
+                    if enable_auto_insecure_https(url, "self-signed certificate presented by target"):
+                        evidence.append("HTTPS certificate verification was disabled automatically for target HTTP checks")
+                    elif cfg.insecure_https:
+                        evidence.append("HTTPS certificate verification is disabled for target HTTP checks")
             else:
                 evidence.append("Certificate metadata parser unavailable; install cryptography for subject/issuer/validity")
 
-            return finding(name, "ok", "low", evidence, raw=raw_out, finding_type="network")
+            status = "warn" if raw_out.get("self_issued") else "ok"
+            risk = "low" if raw_out.get("self_issued") else "low"
+            return finding(name, status, risk, evidence, raw=raw_out, finding_type="network")
 
         return finding(
             name,
@@ -2981,6 +3035,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clearnet-url", help="optional clearnet mirror URL for Onion-Location validation")
     parser.add_argument("-o", "--output", help="write report to file (JSON if --json, else TXT)")
     parser.add_argument("--insecure-https", action="store_true", help="disable TLS verification for HTTPS HTTP requests")
+    parser.add_argument("--no-auto-insecure-https", action="store_true", help="do not automatically disable HTTPS verification for self-signed target onion certificates")
     parser.add_argument("--scheme", choices=["auto", "http", "https"], default="auto", help="origin scheme mode (default: auto)")
     parser.add_argument("--retries", type=int, default=2, help="network retries for transient onion errors (default: 2)")
     parser.add_argument("--workers", type=int, default=4, help="parallel workers for crawler page fetches (default: 4)")
@@ -3003,6 +3058,8 @@ def main() -> None:
     cfg.tls_timeout = args.tls_timeout
     cfg.sleep = args.sleep
     cfg.insecure_https = args.insecure_https
+    cfg.auto_insecure_https = not args.no_auto_insecure_https
+    cfg.auto_insecure_https_reason = None
     cfg.no_crawl = args.no_crawl
     cfg.crawl_max_urls = max(1, args.max_urls)
     cfg.crawl_depth = max(0, args.depth)
@@ -3119,7 +3176,7 @@ def main() -> None:
 
     payload = {
         "tool": "onionscout",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "target": base_url,
         "config": {
             "http_timeout": cfg.http_timeout,
@@ -3128,6 +3185,8 @@ def main() -> None:
             "sleep": cfg.sleep,
             "socks": f"{cfg.socks_host}:{cfg.socks_port}",
             "insecure_https": cfg.insecure_https,
+            "auto_insecure_https": cfg.auto_insecure_https,
+            "auto_insecure_https_reason": cfg.auto_insecure_https_reason,
             "no_crawl": cfg.no_crawl,
             "max_urls": cfg.crawl_max_urls,
             "depth": cfg.crawl_depth,
