@@ -50,7 +50,7 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.1.4
+v0.1.5
 """
 
 console = Console()
@@ -73,6 +73,8 @@ class Config:
     scheme: str = "auto"
     retries: int = 2
     workers: int = 4
+    cookie_header: Optional[str] = None
+    target_host: str = ""
 
 
 cfg = Config()
@@ -107,7 +109,7 @@ def configure_tor_proxy(host: str, port: int) -> None:
 
 
 def set_cookie_header(cookie_str: str) -> None:
-    session.headers["Cookie"] = cookie_str.strip()
+    cfg.cookie_header = cookie_str.strip()
 
 
 class LinkExtractor(HTMLParser):
@@ -272,6 +274,7 @@ SECURITYTXT_DIRECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 ASSET_EXT_SKIP = re.compile(r"\.(?:png|jpe?g|gif|webp|svg|ico|mp4|mp3|wav|woff2?|ttf|eot|pdf|zip|rar|7z)$", re.IGNORECASE)
+ONION_V3_HOST_RE = re.compile(r"^[a-z2-7]{56}\.onion$", re.IGNORECASE)
 
 LEAK_HEADERS = [
     "Server", "X-Powered-By", "X-AspNet-Version", "X-AspNetMvc-Version", "X-Runtime", "X-Version",
@@ -466,6 +469,12 @@ def should_retry_error(kind: str) -> bool:
     return kind in {"timeout", "reset", "proxy_error", "tor_circuit", "network_error"}
 
 
+def is_target_onion_url(url: str) -> bool:
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    return p.scheme in {"http", "https"} and host.endswith(".onion") and bool(cfg.target_host and host == cfg.target_host)
+
+
 def request(
     method: str,
     url: str,
@@ -474,18 +483,30 @@ def request(
     allow_redirects: bool = False,
     verify: Optional[bool] = None,
     headers: Optional[dict[str, str]] = None,
+    send_cookie: bool = True,
 ):
     if timeout is None:
         timeout = cfg.http_timeout
     if verify is None:
         verify = not cfg.insecure_https
 
+    req_headers = dict(headers or {})
+    if send_cookie and cfg.cookie_header and is_target_onion_url(url):
+        req_headers["Cookie"] = cfg.cookie_header
+
     last_error = None
     attempts = max(1, cfg.retries + 1)
 
     for attempt in range(attempts):
         try:
-            return session.request(method, url, timeout=timeout, allow_redirects=allow_redirects, verify=verify, headers=headers)
+            return session.request(
+                method,
+                url,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+                verify=verify,
+                headers=req_headers or None,
+            )
         except Exception as e:
             info = classify_network_error(e)
             last_error = e
@@ -504,6 +525,33 @@ def same_onion_host(base_url: str, full_url: str) -> bool:
     return bool(b and h and b == h)
 
 
+def _policy_violation(url: str) -> Optional[dict[str, Any]]:
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+
+    if p.scheme not in {"http", "https"} or not host.endswith(".onion"):
+        return {
+            "response": None,
+            "leak": url,
+            "redirect_chain": [],
+            "final_url": url,
+            "error": "non-onion URL blocked by policy",
+            "error_kind": "clearnet_blocked",
+        }
+
+    if cfg.target_host and host != cfg.target_host:
+        return {
+            "response": None,
+            "leak": url,
+            "redirect_chain": [],
+            "final_url": url,
+            "error": "cross-onion URL blocked by policy",
+            "error_kind": "cross_onion_blocked",
+        }
+
+    return None
+
+
 def fetch_with_policy(
     url: str,
     *,
@@ -516,6 +564,11 @@ def fetch_with_policy(
     current = url
 
     for _ in range(max_hops + 1):
+        policy_error = _policy_violation(current)
+        if policy_error:
+            policy_error["redirect_chain"] = visited
+            return policy_error
+
         try:
             r = request(method, current, timeout=timeout, allow_redirects=False, verify=verify)
         except Exception as e:
@@ -544,17 +597,7 @@ def fetch_with_policy(
         if not loc:
             return {"response": r, "leak": None, "redirect_chain": visited, "final_url": current, "status_code": r.status_code}
 
-        nxt = urljoin(current, loc)
-        pu = urlparse(nxt)
-
-        if pu.scheme not in ("http", "https"):
-            return {"response": None, "leak": nxt, "redirect_chain": visited, "final_url": current}
-
-        host = (pu.hostname or "").lower()
-        if not host.endswith(".onion"):
-            return {"response": None, "leak": nxt, "redirect_chain": visited, "final_url": current}
-
-        current = nxt
+        current = urljoin(current, loc)
 
     return {"response": None, "leak": None, "redirect_chain": visited, "final_url": current, "error": "too many redirects", "error_kind": "redirect_loop"}
 
@@ -574,10 +617,50 @@ def error_finding(name: str, e: Exception) -> dict[str, Any]:
     return finding(name, "error", "info", f"{type(e).__name__}: {e}", raw={"exception": repr(e)}, finding_type="internal")
 
 
+def no_response_finding(name: str, res: dict[str, Any]) -> dict[str, Any]:
+    kind = res.get("error_kind", "unknown")
+    err = res.get("error", "unknown error")
+    return finding(name, "warn", "low", f"No response ({kind}: {err})", raw=res)
+
+
+def make_json_safe(value: Any) -> Any:
+    if isinstance(value, requests.Response):
+        return {
+            "url": value.url,
+            "status_code": value.status_code,
+            "headers": dict(value.headers or {}),
+            "content_length": len(value.content or b""),
+        }
+    if isinstance(value, bytes):
+        return {"bytes_len": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def check_target_onion_address(url: str) -> dict[str, Any]:
+    name = "Target onion address"
+    host = (urlparse(url).hostname or "").lower()
+    if ONION_V3_HOST_RE.match(host):
+        return finding(name, "ok", "info", "Target uses a valid-looking onion v3 hostname", raw={"host": host})
+    return finding(
+        name,
+        "warn",
+        "medium",
+        "Target hostname does not look like a standard 56-character onion v3 address",
+        raw={"host": host},
+        finding_type="policy",
+    )
+
+
 def check_tor_proxy() -> dict[str, Any]:
     name = "SOCKS/Tor connectivity check"
     try:
-        r = request("GET", "http://check.torproject.org", timeout=5, allow_redirects=True, verify=False)
+        r = request("GET", "http://check.torproject.org", timeout=5, allow_redirects=True, verify=False, send_cookie=False)
         ok = "Congratulations" in (r.text or "")
         return finding(name, "ok" if ok else "warn", "low", "Tor exit connectivity confirmed" if ok else "Tor exit check failed (may be expected for pure onion usage)")
     except Exception as e:
@@ -1051,6 +1134,8 @@ def check_protocol_relative_links(url: str) -> dict[str, Any]:
         if res.get("leak"):
             return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
         links = PROTO_REL_RE.findall(r.text or "")
         out = []
         for l in sorted(set(links)):
@@ -1086,6 +1171,8 @@ def check_meta_redirects(url: str) -> dict[str, Any]:
         if res.get("leak"):
             return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
         p = html_extract(r.text or "")
         out = [x for x in _resolve_candidates(url, p.meta_refresh_targets) if _is_clearnet(x)]
         if out:
@@ -1134,6 +1221,8 @@ def check_form_actions(url: str) -> dict[str, Any]:
         if res.get("leak"):
             return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
         p = html_extract(r.text or "")
         out = [x for x in _resolve_candidates(url, p.form_actions) if _is_clearnet(x)]
         if out:
@@ -1150,6 +1239,8 @@ def check_websocket_endpoints(url: str) -> dict[str, Any]:
         if res.get("leak"):
             return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
         wss = re.findall(WEBSOCKET_RE, r.text or "")
         out = [ws for ws in sorted(set(wss)) if _is_clearnet(ws)]
         if out:
@@ -1318,12 +1409,14 @@ def check_http_availability(url: str) -> dict[str, Any]:
 
 def check_https_tls(url: str) -> dict[str, Any]:
     name = "HTTPS/TLS sanity"
-    host = urlparse(url).hostname or ""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or 443
     if not host:
         return finding(name, "error", "info", "Invalid host")
 
     try:
-        raw = _make_socks_socket(host, 443, cfg.tls_timeout)
+        raw = _make_socks_socket(host, port, cfg.tls_timeout)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -1335,7 +1428,7 @@ def check_https_tls(url: str) -> dict[str, Any]:
         ssock.close()
 
         evidence = [
-            "HTTPS/TLS reachable",
+            f"HTTPS/TLS reachable on port {port}",
             f"TLS version: {version or 'n/a'}",
             f"Cipher: {cipher[0] if cipher else 'n/a'}",
         ]
@@ -1374,7 +1467,7 @@ def check_https_tls(url: str) -> dict[str, Any]:
             name,
             "warn",
             "medium",
-            "HTTPS/TLS reachable on 443 but peer certificate was not returned",
+            f"HTTPS/TLS reachable on port {port} but peer certificate was not returned",
             raw=raw_out,
             finding_type="network",
         )
@@ -1385,7 +1478,7 @@ def check_https_tls(url: str) -> dict[str, Any]:
             name,
             "info",
             "info",
-            f"HTTPS/TLS not reachable on 443 ({info['kind']}): {info['error']}",
+            f"HTTPS/TLS not reachable on port {port} ({info['kind']}): {info['error']}",
             raw=info,
             finding_type="network",
         )
@@ -1456,6 +1549,8 @@ def check_meta_and_link_leaks(url: str) -> dict[str, Any]:
         if res.get("leak"):
             return finding(name, "fail", "high", f"Redirect leak \u2192 {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
+        if not r:
+            return no_response_finding(name, res)
         p = html_extract(r.text or "")
         buckets = {
             "canonical": _resolve_candidates(url, p.canonical_urls),
@@ -1921,6 +2016,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
+    cfg.target_host = (urlparse(target_input).hostname or "").lower()
     base_url, origin_info = choose_working_origin(target_input, cfg.scheme)
 
     if not args.json:
@@ -1951,6 +2047,7 @@ def main() -> None:
 
     tasks += [
         ("Cookie provided", lambda: check_cookie_present(args.cookie)),
+        ("Target onion address", lambda: check_target_onion_address(base_url)),
         ("Origin selection", lambda: finding("Origin selection", "info", "info", origin_info)),
         ("HTTP origin availability", lambda: check_http_availability(base_url)),
         ("Detect server", lambda: detect_server(base_url)),
@@ -1992,7 +2089,7 @@ def main() -> None:
 
     payload = {
         "tool": "onionscout",
-        "version": "0.1.4",
+        "version": "0.1.5",
         "target": base_url,
         "config": {
             "http_timeout": cfg.http_timeout,
@@ -2007,6 +2104,7 @@ def main() -> None:
             "scheme": cfg.scheme,
             "retries": cfg.retries,
             "workers": cfg.workers,
+            "cookie_scoped_to_target": bool(cfg.cookie_header),
             "html_parser": "selectolax" if SelectolaxHTMLParser is not None else "stdlib",
             "origin_selection": origin_info,
         },
@@ -2014,7 +2112,7 @@ def main() -> None:
     }
 
     if args.json:
-        out_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        out_json = json.dumps(make_json_safe(payload), ensure_ascii=False, indent=2)
         if args.output:
             with open(args.output, "w", encoding="utf-8") as f:
                 f.write(out_json + "\n")

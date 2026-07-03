@@ -13,8 +13,11 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 ### Network and origin handling
 
 - Tor SOCKS5h support
+- onion v3 hostname sanity check
 - smart HTTP/HTTPS origin selection
 - `.onion`-safe redirect policy
+- initial clearnet URL blocking for policy-managed fetches
+- cross-onion redirect blocking
 - redirect leak detection to clearnet
 - retry handling for common onion/Tor network errors
 - separate HTTP, SSH, and TLS timeouts
@@ -172,7 +175,7 @@ onionscout -u exampleonionaddress.onion --http-timeout 20 --ssh-timeout 8 --tls-
 
 ## Authenticated scans
 
-Some onion services require an authenticated session. You can pass a raw HTTP `Cookie` header with `--cookie`.
+Some onion services require an authenticated session. You can pass a raw HTTP `Cookie` header with `--cookie`. The cookie is scoped by onionscout to the selected target onion host and is not sent to the Tor connectivity check or blocked off-target URLs.
 
 Example:
 
@@ -222,5 +225,5 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 
 - Most onion services use plain HTTP internally; HTTPS is supported when present.
 - In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
-- Redirects are followed only when they stay on `.onion`; clearnet redirects are reported as leaks.
+- Redirects are followed only when they stay on the selected target onion host; clearnet and cross-onion redirects are reported instead of being fetched.
 - Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
