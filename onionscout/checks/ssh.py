@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 import paramiko
 
-from ..core import _make_socks_socket, cfg
+from ..core import _make_tor_socket, cfg
 from ..findings import finding
 
 def check_ssh_fingerprint(url: str, ssh_port: int = 22) -> dict[str, Any]:
@@ -14,7 +14,7 @@ def check_ssh_fingerprint(url: str, ssh_port: int = 22) -> dict[str, Any]:
     if not host:
         return finding(name, "error", "info", "Invalid host")
     try:
-        sock = _make_socks_socket(host, ssh_port, cfg.ssh_timeout)
+        sock = _make_tor_socket(host, ssh_port, cfg.ssh_timeout)
         transport = paramiko.Transport(sock)
         transport.banner_timeout = cfg.ssh_timeout
         transport.start_client(timeout=cfg.ssh_timeout)

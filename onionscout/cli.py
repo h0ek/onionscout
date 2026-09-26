@@ -72,6 +72,7 @@ from .core import (
     cfg,
     choose_working_origin,
     configure_tor_proxy,
+    configure_transparent_tor,
     rebuild_retry_adapter,
     console,
     normalize_url,
@@ -161,9 +162,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssh-timeout", type=float, default=10.0, help="SSH timeout in seconds (default: 10.0)")
     parser.add_argument("--tls-timeout", type=float, default=12.0, help="TLS timeout in seconds (default: 12.0)")
     parser.add_argument("-s", "--sleep", type=float, default=1.0, help="minimum seconds between HTTP requests (default: 1.0)")
-    parser.add_argument("--socks", default="127.0.0.1:9050", help="Tor SOCKS5h proxy (default: 127.0.0.1:9050)")
+    parser.add_argument("--tor-mode", choices=["socks", "transparent"], default="socks", help="Tor transport mode: socks or transparent (default: socks)")
+    parser.add_argument("--socks", default="127.0.0.1:9050", help="Tor SOCKS5h proxy for --tor-mode socks (default: 127.0.0.1:9050)")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port for fingerprint check (default: 22)")
-    parser.add_argument("--skip-tor-check", action="store_true", help="skip external Tor Project verification; local SOCKS5 preflight is always required")
+    parser.add_argument("--skip-tor-check", action="store_true", help="skip external Tor Project verification in SOCKS mode; unavailable in transparent mode")
     parser.add_argument("--json", action="store_true", help="output JSON instead of a table")
     parser.add_argument("--html-report", help="write an HTML report to file")
     parser.add_argument("--profile", choices=["basic", "safe", "extended"], default="safe", help="check profile (default: safe)")
@@ -305,20 +307,26 @@ def main() -> None:
             clearnet_url = "https://" + clearnet_url
         cfg.clearnet_url = clearnet_url.rstrip("/")
 
-    try:
-        socks_host, socks_port = parse_socks(args.socks)
-        cfg.socks_host, cfg.socks_port = socks_host, socks_port
-        configure_tor_proxy(socks_host, socks_port)
-        preflight_tor_socks(socks_host, socks_port, min(cfg.http_timeout, 5.0))
-    except Exception as e:
-        message = f"Tor SOCKS preflight failed: {e}"
-        if args.json:
-            print(json.dumps({"tool": "onionscout", "version": VERSION, "status": "error", "error": message}, ensure_ascii=False, indent=2))
-        else:
-            console.print(ASCII_LOGO)
-            console.print(f"[red]Error: {message}[/red]")
-            console.print("[red]Scan aborted before contacting the target.[/red]")
-        sys.exit(1)
+    if args.tor_mode == "transparent" and args.skip_tor_check:
+        parser.error("--skip-tor-check cannot be used with --tor-mode transparent")
+
+    if args.tor_mode == "socks":
+        try:
+            socks_host, socks_port = parse_socks(args.socks)
+            cfg.socks_host, cfg.socks_port = socks_host, socks_port
+            configure_tor_proxy(socks_host, socks_port)
+            preflight_tor_socks(socks_host, socks_port, min(cfg.http_timeout, 5.0))
+        except Exception as e:
+            message = f"Tor SOCKS preflight failed: {e}"
+            if args.json:
+                print(json.dumps({"tool": "onionscout", "version": VERSION, "status": "error", "error": message}, ensure_ascii=False, indent=2))
+            else:
+                console.print(ASCII_LOGO)
+                console.print(f"[red]Error: {message}[/red]")
+                console.print("[red]Scan aborted before contacting the target.[/red]")
+            sys.exit(1)
+    else:
+        configure_transparent_tor()
 
     if args.skip_tor_check:
         tor_check_result = finding("SOCKS/Tor connectivity check", "info", "info", "External Tor Project verification skipped; local SOCKS5 preflight passed")
@@ -331,7 +339,10 @@ def main() -> None:
             else:
                 console.print(ASCII_LOGO)
                 console.print(f"[red]Error: {message}[/red]")
-                console.print("[red]Scan aborted before contacting the target. Use --skip-tor-check only when external Tor Project verification is intentionally unavailable.[/red]")
+                if args.tor_mode == "transparent":
+                    console.print("[red]Scan aborted before contacting the target. Transparent mode requires verified Tor egress.[/red]")
+                else:
+                    console.print("[red]Scan aborted before contacting the target. Use --skip-tor-check only when external Tor Project verification is intentionally unavailable.[/red]")
             sys.exit(1)
 
     if args.cookie:
@@ -446,7 +457,8 @@ def main() -> None:
             "ssh_timeout": cfg.ssh_timeout,
             "tls_timeout": cfg.tls_timeout,
             "sleep": cfg.sleep,
-            "socks": f"{cfg.socks_host}:{cfg.socks_port}",
+            "tor_mode": cfg.tor_mode,
+            "socks": f"{cfg.socks_host}:{cfg.socks_port}" if cfg.tor_mode == "socks" else None,
             "insecure_https": cfg.insecure_https,
             "auto_insecure_https": cfg.auto_insecure_https,
             "auto_insecure_https_reason": cfg.auto_insecure_https_reason,

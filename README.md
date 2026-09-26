@@ -12,12 +12,12 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 
 ### Network and origin handling
 
-- Tor SOCKS5h support
-- mandatory SOCKS5 preflight with fail-fast before target probing
+- Tor SOCKS5h and transparent Tor transport support
+- fail-fast Tor transport verification before target probing
 - onion v3 address checksum validation
 - smart HTTP/HTTPS origin selection
 - `.onion`-safe redirect policy
-- strict target origin/port allowlist and fail-closed Tor SOCKS5h transport
+- strict target origin/port allowlist and fail-closed Tor transport
 - cross-onion redirect blocking
 - redirect leak detection to clearnet
 - bounded retry handling for common onion/Tor network errors
@@ -108,10 +108,9 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 ## Requirements
 
 - Python 3.10+
-- Tor SOCKS proxy:
-  - Tor daemon: `127.0.0.1:9050`
-  - Tor Browser: `127.0.0.1:9150`
-  - Whonix Gateway example: `10.152.152.10:9050`
+- Tor transport:
+  - SOCKS5h: Tor daemon `127.0.0.1:9050`, Tor Browser `127.0.0.1:9150`, or another reachable Tor SOCKS endpoint
+  - transparent: a system whose TCP/DNS traffic is already enforced through Tor, such as a correctly configured workstation behind Whonix-Gateway
 
 ## Installation
 
@@ -155,6 +154,14 @@ Use Tor Browser SOCKS:
 ```
 onionscout -u http://exampleonionaddress.onion --socks 127.0.0.1:9150 --skip-tor-check
 ```
+
+Use a transparently torified workstation, for example Kali behind Whonix-Gateway:
+
+```
+onionscout -u http://exampleonionaddress.onion --tor-mode transparent
+```
+
+Transparent mode does not use a local SOCKS proxy. It requires successful Tor Project egress verification before the target is contacted and relies on the operating system or gateway to enforce TCP/DNS through Tor.
 
 Force HTTP:
 
@@ -288,8 +295,9 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 ```
 -u, --url              Target .onion URL
 --scheme              Origin scheme mode: auto, http, https
---socks               SOCKS5h proxy, default 127.0.0.1:9050
---skip-tor-check      Skip external Tor Project verification; local SOCKS5 preflight still runs
+--tor-mode            Tor transport mode: socks or transparent, default socks
+--socks               SOCKS5h proxy for socks mode, default 127.0.0.1:9050
+--skip-tor-check      Skip external Tor Project verification in socks mode only
 --http-timeout        HTTP timeout
 --ssh-timeout         SSH timeout
 --tls-timeout         TLS timeout
@@ -323,7 +331,7 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 
 - Most onion services use plain HTTP internally; HTTPS is supported when present.
 - In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
-- Before origin probing, onionscout requires a working SOCKS5 endpoint and aborts immediately if it is unavailable or invalid. By default it also verifies Tor egress with Tor Project; `--skip-tor-check` skips only that external verification.
+- In `socks` mode, onionscout requires a working SOCKS5 endpoint before origin probing and aborts if it is unavailable or invalid. In `transparent` mode, no local SOCKS proxy is used and successful Tor Project egress verification is mandatory before the target is contacted. Transparent mode relies on external fail-closed TCP/DNS Tor enforcement, such as a correctly configured Whonix-Gateway. `--skip-tor-check` is available only in `socks` mode.
 - Redirects are followed only within the approved onion host and port; clearnet and cross-onion redirects are reported, not fetched.
 - Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
 - `basic` is for quick low-noise checks, `safe` is the default, and `extended` increases selected metadata/archive review limits.

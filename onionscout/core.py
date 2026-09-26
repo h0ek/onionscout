@@ -53,10 +53,10 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.4.2
+v0.4.3
 """
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -74,6 +74,7 @@ class Config:
     sleep: float = 1.0
     socks_host: str = "127.0.0.1"
     socks_port: int = 9050
+    tor_mode: str = "socks"
     insecure_https: bool = False
     auto_insecure_https: bool = True
     auto_insecure_https_reason: Optional[str] = None
@@ -120,8 +121,15 @@ def configure_tor_proxy(host: str, port: int) -> None:
     if not host or not 1 <= port <= 65535:
         raise ValueError("Invalid SOCKS proxy")
     proxy = f"socks5h://{host}:{port}"
+    cfg.tor_mode = "socks"
     session.trust_env = False
     session.proxies = {"http": proxy, "https": proxy}
+
+
+def configure_transparent_tor() -> None:
+    cfg.tor_mode = "transparent"
+    session.trust_env = False
+    session.proxies = {}
 
 
 def preflight_tor_socks(host: str, port: int, timeout: float = 5.0) -> None:
@@ -788,8 +796,14 @@ def request(
     if allow_redirects:
         raise ValueError("Automatic redirects are disabled; use fetch_with_policy")
     session.trust_env = False
-    if not session.proxies.get("http", "").startswith("socks5h://") or not session.proxies.get("https", "").startswith("socks5h://"):
-        raise RuntimeError("Tor SOCKS5h proxy is not configured")
+    if cfg.tor_mode == "socks":
+        if not session.proxies.get("http", "").startswith("socks5h://") or not session.proxies.get("https", "").startswith("socks5h://"):
+            raise RuntimeError("Tor SOCKS5h proxy is not configured")
+    elif cfg.tor_mode == "transparent":
+        if session.proxies:
+            raise RuntimeError("Proxy configuration must be empty in transparent Tor mode")
+    else:
+        raise RuntimeError("Invalid Tor transport mode")
     if timeout is None:
         timeout = cfg.http_timeout
     if verify is None:
@@ -1016,7 +1030,11 @@ def _header_value(headers, name: str) -> str:
         return ""
     return headers.get(name) or headers.get(name.lower()) or headers.get(name.title()) or ""
 
-def _make_socks_socket(host: str, port: int, timeout: float):
+def _make_tor_socket(host: str, port: int, timeout: float):
+    if cfg.tor_mode == "transparent":
+        return socket.create_connection((host, port), timeout=timeout)
+    if cfg.tor_mode != "socks":
+        raise RuntimeError("Invalid Tor transport mode")
     if not socks:
         raise RuntimeError("PySocks not installed")
     s = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1024,6 +1042,10 @@ def _make_socks_socket(host: str, port: int, timeout: float):
     s.settimeout(timeout)
     s.connect((host, port))
     return s
+
+
+def _make_socks_socket(host: str, port: int, timeout: float):
+    return _make_tor_socket(host, port, timeout)
 
 def _norm_url(base_url: str, u: str) -> Optional[str]:
     if not u:

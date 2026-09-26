@@ -6,7 +6,7 @@ from typing import Any
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from ..core import _make_socks_socket, cfg, classify_network_error, default_backend, enable_auto_insecure_https, x509
+from ..core import _make_tor_socket, cfg, classify_network_error, default_backend, enable_auto_insecure_https, x509
 from ..findings import finding
 
 def check_https_tls(url: str) -> dict[str, Any]:
@@ -18,7 +18,7 @@ def check_https_tls(url: str) -> dict[str, Any]:
         return finding(name, "error", "info", "Invalid host")
 
     try:
-        raw = _make_socks_socket(host, port, cfg.tls_timeout)
+        raw = _make_tor_socket(host, port, cfg.tls_timeout)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
