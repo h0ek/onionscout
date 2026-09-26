@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onionscout"
-version = "0.3.1"
+version = "0.4.1"
 description = "CLI tool for auditing Tor hidden-service (.onion) security leaks and misconfigurations"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -55,7 +55,7 @@ Repository = "https://github.com/h0ek/onionscout"
 Issues = "https://github.com/h0ek/onionscout/issues"
 
 [project.scripts]
-onionscout = "onionscout:main"
+onionscout = "onionscout.cli:main"
 
-[tool.setuptools]
-py-modules = ["onionscout"]
+[tool.setuptools.packages.find]
+include = ["onionscout*"]

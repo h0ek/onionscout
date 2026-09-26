@@ -13,13 +13,14 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 ### Network and origin handling
 
 - Tor SOCKS5h support
-- onion v3 hostname sanity check
+- onion v3 address checksum validation
 - smart HTTP/HTTPS origin selection
 - `.onion`-safe redirect policy
-- initial clearnet URL blocking for policy-managed fetches
+- strict target origin/port allowlist and fail-closed Tor SOCKS5h transport
 - cross-onion redirect blocking
 - redirect leak detection to clearnet
-- retry handling for common onion/Tor network errors
+- bounded retry handling for common onion/Tor network errors
+- response body, request-count, and scan-time limits
 - separate HTTP, SSH, and TLS timeouts
 
 ### Web fingerprinting
@@ -28,7 +29,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - default error-page fingerprinting
 - favicon discovery and Shodan-compatible favicon hash
 - ETag extraction and Shodan query helper
-- TLS reachability, TLS version, cipher, certificate SHA256, issuer, subject, validity, and self-signed/self-issued certificate detection
+- TLS reachability, TLS version, cipher, certificate SHA256, issuer, subject, validity, and self-issued certificate indicator
 
 ### Leak and de-anonymization checks
 
@@ -51,8 +52,12 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - baseline security headers
 - CORS misconfiguration classification
 - JavaScript URL, IP, source-map, and secret-candidate leak checks
+- Canvas, WebGL, WebRTC, STUN/TURN, AudioContext, and device-fingerprinting API indicators
+- analytics/tracker identifier correlation
+- cloud/CDN infrastructure correlation indicators
+- hidden/external iframe and conservative suspicious-JavaScript indicators
 - lightweight image metadata sniffing for EXIF/XMP-style markers, URLs, IPs, and GPS hints
-- linked document metadata sniffing for authors, tool names, paths, IPs, emails, and clearnet URLs
+- linked document metadata sniffing for authors, tool names, paths, IPs, emails, and clearnet URLs (including limited Office XML extraction)
 
 ### Hidden-service hygiene checks
 
@@ -62,6 +67,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - WebDAV exposure
 - HTTP method exposure checks, including TRACE, PUT, DELETE, PATCH, PROPFIND, and MKCOL
 - common sensitive files and paths
+- Swagger/OpenAPI, GraphQL, and common debug/API endpoint exposure checks
 - backup, archive, SQL dump, and stale file leak detection
 - directory listing detection
 - verbose error-page fingerprinting
@@ -96,6 +102,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 - standalone HTML report export
 - check profiles: basic, safe, extended
 - check selection with `--only` and `--skip`
+- optional local SQLite scan history and diffing
 
 ## Requirements
 
@@ -230,6 +237,24 @@ Tune timeouts:
 onionscout -u exampleonionaddress.onion --http-timeout 20 --ssh-timeout 8 --tls-timeout 12
 ```
 
+Save a scan to local history:
+
+```
+onionscout -u exampleonionaddress.onion --save-scan
+```
+
+Compare against the latest saved scan and save the current result:
+
+```
+onionscout -u exampleonionaddress.onion --diff
+```
+
+Show saved history for a target:
+
+```
+onionscout -u exampleonionaddress.onion --history
+```
+
 ## Authenticated scans
 
 Some onion services require an authenticated session. You can pass a raw HTTP `Cookie` header with `--cookie`. The cookie is scoped by onionscout to the selected target onion host and is not sent to the Tor connectivity check or blocked off-target URLs.
@@ -269,17 +294,25 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 --tls-timeout         TLS timeout
 --ssh-port            SSH port for fingerprint check
 --retries             Retries for transient onion/Tor errors
+--max-requests        Maximum HTTP requests per scan
+--max-body-bytes      Maximum decompressed response size
+--max-duration        Scan time budget in seconds
 --profile             Check profile: basic, safe, extended
 --only                Run only selected checks
 --skip                Skip selected checks
 --cookie              Raw HTTP Cookie header, e.g. 'access=VALUE; session=VALUE2'
 --clearnet-url        Optional clearnet mirror URL for Onion-Location validation
---insecure-https      Disable HTTPS certificate verification for HTTP requests
+--insecure-https      Disable HTTPS verification for the target onion only
 --no-auto-insecure-https
                        Keep strict verification even for self-signed target onion certificates
 --no-crawl            Disable crawler-based checks
 --max-urls            Crawler URL limit
 --depth               Crawler depth
+--save-scan           Save this scan to local SQLite history
+--diff                Compare with latest saved scan and save this scan
+--history             Show saved scan history for target and exit
+--history-limit       Number of history rows to show
+--history-db          Custom SQLite history database path
 --json                Output JSON
 --html-report         Save standalone HTML report
 -o, --output          Save report to file
@@ -289,7 +322,10 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 
 - Most onion services use plain HTTP internally; HTTPS is supported when present.
 - In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
-- Redirects are followed only when they stay on the selected target onion host; clearnet and cross-onion redirects are reported instead of being fetched.
+- Redirects are followed only within the approved onion host and port; clearnet and cross-onion redirects are reported, not fetched.
 - Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
 - `basic` is for quick low-noise checks, `safe` is the default, and `extended` increases selected metadata/archive review limits.
-- `--only` and `--skip` accept check names or short aliases such as `headers`, `js`, `robots`, `metadata`, `docs`, `backup`, and `errors`.
+- `--only` and `--skip` accept check names or short aliases such as `headers`, `js`, `fingerprinting`, `api`, `cloud`, `analytics`, `iframes`, `robots`, `metadata`, `docs`, `backup`, and `errors`.
+- `--save-scan` stores a local, redacted result. `--diff` reports unverifiable checks as UNKNOWN rather than resolved.
+- `--workers` is retained for CLI compatibility; crawling is sequential and rate-limited.
+- Scan history is stored in `${XDG_DATA_HOME:-~/.local/share}/onionscout/onionscout.db` unless `--history-db` is used.
