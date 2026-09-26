@@ -54,10 +54,10 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.4.5
+v0.4.6
 """
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -1030,8 +1030,12 @@ def get_soft404_baseline(base_url: str):
     cache = cfg.soft404_cache
     if cache is not None and base in cache:
         return cache[base]
-    tokens = [uuid.uuid4().hex, uuid.uuid4().hex]
-    probe_paths = [f"/.onionscout-missing-{tokens[0]}", f"/.onionscout-missing-{tokens[1]}.zip"]
+    tokens = [uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex]
+    probe_paths = [
+        f"/onionscout-missing-{tokens[0]}",
+        f"/onionscout-missing-{tokens[1]}.zip",
+        f"/onionscout-missing-{tokens[2]}/probe",
+    ]
     samples = []
     for path in probe_paths:
         try:
@@ -1042,8 +1046,18 @@ def get_soft404_baseline(base_url: str):
             samples.append(_soft404_signature(r))
         except Exception:
             continue
-    stable = len(samples) >= 2 and _soft404_signature_similarity(samples[0], samples[1]) >= 0.82
-    baseline = {"stable": stable, "samples": samples, "probes": len(probe_paths)} if samples else None
+    stable_samples = []
+    for idx, sample in enumerate(samples):
+        if any(
+            idx != other_idx and _soft404_signature_similarity(sample, other) >= 0.82
+            for other_idx, other in enumerate(samples)
+        ):
+            stable_samples.append(sample)
+    baseline = {
+        "stable": len(stable_samples) >= 2,
+        "samples": stable_samples,
+        "probes": len(probe_paths),
+    } if samples else None
     if cache is not None:
         cache[base] = baseline
     return baseline

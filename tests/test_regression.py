@@ -160,7 +160,7 @@ class RegressionTests(unittest.TestCase):
         candidate = response('<!doctype html><html><head><title>404 - Not Found</title></head><body><img src="/static/404.png"><h1>404</h1><p>Page ' + candidate_url + ' was not found.</p><span>request=abcdef12345678901234567890</span></body></html>', 200, url=candidate_url)
         self.assertTrue(baseline["stable"])
         self.assertIs(baseline, cached)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         self.assertTrue(core.looks_like_soft404(candidate, baseline))
 
     def test_soft404_does_not_hide_distinct_real_page(self):
@@ -345,3 +345,49 @@ class RegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class Soft404ProbeRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = core.cfg
+        core.cfg = core.Config(target_host=HOST, target_port=None, retries=0, sleep=0, soft404_cache={})
+
+    def tearDown(self):
+        core.cfg = self.saved
+
+    def test_soft404_baseline_avoids_dotfile_policy(self):
+        calls = []
+
+        def fake_fetch(url, **kwargs):
+            calls.append(url)
+            path = url[len(BASE):]
+            if path.startswith("/."):
+                return {"response": response("Forbidden", 403, url=url), "leak": None, "final_url": url}
+            body = '<!doctype html><html><head><title>Not Found</title></head><body><h1>404</h1><p>Page not found.</p></body></html>'
+            return {"response": response(body, 200, url=url), "leak": None, "final_url": url}
+
+        with patch.object(core, "fetch_with_policy", side_effect=fake_fetch):
+            baseline = core.get_soft404_baseline(BASE)
+
+        self.assertTrue(baseline["stable"])
+        self.assertEqual(len(baseline["samples"]), 3)
+        self.assertTrue(all(not url[len(BASE):].startswith("/.") for url in calls))
+        candidate = response('<!doctype html><html><head><title>Not Found</title></head><body><h1>404</h1><p>Page not found.</p></body></html>', 200, url=BASE + "/backup.zip")
+        self.assertTrue(core.looks_like_soft404(candidate, baseline))
+
+    def test_soft404_baseline_uses_stable_pair_when_one_probe_differs(self):
+        calls = []
+
+        def fake_fetch(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/probe"):
+                return {"response": response('<html><title>Special</title><body>different handler</body></html>', 200, url=url), "leak": None, "final_url": url}
+            body = '<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>'
+            return {"response": response(body, 200, url=url), "leak": None, "final_url": url}
+
+        with patch.object(core, "fetch_with_policy", side_effect=fake_fetch):
+            baseline = core.get_soft404_baseline(BASE)
+
+        self.assertTrue(baseline["stable"])
+        self.assertEqual(len(baseline["samples"]), 2)
+        candidate = response('<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>', 200, url=BASE + "/config.json")
+        self.assertTrue(core.looks_like_soft404(candidate, baseline))
