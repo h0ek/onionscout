@@ -52,7 +52,7 @@ def crawl_links(base_url: str, max_urls: int = 80, depth: int = 1) -> list[str]:
             if r.status_code != 200 or ("html" not in ct and "xhtml" not in ct):
                 continue
             is_homepage = current.rstrip("/") == base.rstrip("/")
-            if not is_homepage and _looks_like_index_redirect_or_soft404(r, soft404_baseline, home_fp):
+            if not is_homepage and _looks_like_index_redirect_or_soft404(result, soft404_baseline, home_fp):
                 continue
             out.append(current)
             if d >= depth:

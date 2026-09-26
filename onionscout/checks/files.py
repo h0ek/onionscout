@@ -119,7 +119,7 @@ def check_files_and_paths(url: str) -> dict[str, Any]:
             r = res.get("response")
             if r is None:
                 continue
-            if r.status_code == 200 and not looks_like_soft404(r, baseline):
+            if r.status_code == 200 and not looks_like_soft404(res, baseline):
                 ct = (r.headers.get("Content-Type", "") or "").lower()
                 size = len(r.content or b"")
                 sample = (r.text or "")[:120].replace("\n", " ").strip() if "text" in ct or "json" in ct or "html" in ct or not ct else ""
@@ -197,7 +197,7 @@ def check_directory_listing(url: str) -> dict[str, Any]:
                 raw.append({"path": path, "leak": res.get("leak")})
                 continue
             r = res.get("response")
-            if r is None or r.status_code != 200 or looks_like_soft404(r, baseline):
+            if r is None or r.status_code != 200 or looks_like_soft404(res, baseline):
                 continue
             ct = (r.headers.get("Content-Type", "") or "").lower()
             text = r.text or ""
@@ -331,7 +331,7 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
             return finding(name, "warn", "low", f"{path}: no response")
         if r.status_code != 200:
             return finding(name, "info", "info", f"{path}: not found (HTTP {r.status_code})", raw={"status_code": r.status_code})
-        if looks_like_soft404(r, baseline):
+        if looks_like_soft404(res, baseline):
             return finding(name, "info", "info", f"{path}: not found (soft-404/catch-all response)", raw={"status_code": r.status_code, "soft404": True})
         reason = _securitytxt_invalid_reason(r)
         if reason:
@@ -364,7 +364,7 @@ def check_well_known(url: str) -> dict[str, Any]:
                 continue
             r = res.get("response")
             if r is not None and r.status_code == 200:
-                if looks_like_soft404(r, baseline):
+                if looks_like_soft404(res, baseline):
                     continue
                 ct = (r.headers.get("Content-Type", "") or "").lower()
                 if _looks_like_html(r.content or b"", ct):
@@ -425,7 +425,7 @@ def check_backup_archives(url: str) -> dict[str, Any]:
                 r = res.get("response")
                 if r is None or r.status_code != 200:
                     continue
-            if looks_like_soft404(r, baseline):
+            if looks_like_soft404(res, baseline):
                 continue
             ct = (r.headers.get("Content-Type", "") or "").lower()
             size = int(r.headers.get("Content-Length") or len(r.content or b"") or 0)

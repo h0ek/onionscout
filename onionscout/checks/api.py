@@ -79,7 +79,7 @@ def check_api_exposure(url: str) -> dict[str, Any]:
                 hits.append({"path": path, "issue": "redirect leak", "target": res.get("leak")})
                 continue
             r = res.get("response")
-            if r is None or looks_like_soft404(r, baseline):
+            if r is None or looks_like_soft404(res, baseline):
                 continue
             labels = _classify_api_response(path, r)
             if labels:

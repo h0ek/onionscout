@@ -54,10 +54,10 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.4.6
+v0.4.7
 """
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -963,23 +963,58 @@ def find_valid_ipv4(text: str) -> Optional[str]:
             return m.group(0)
     return None
 
-def _soft404_normalize(text: str, response_url: str = "") -> str:
+def _fallback_path(url: str) -> str:
+    parsed = urlparse(url or "")
+    path = re.sub(r"/+", "/", parsed.path or "/")
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return path or "/"
+
+
+def _fallback_destination(url: str, request_url: str = "") -> str:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{host}:{port}" if port else host
+    path = _fallback_path(url)
+    request_path = _fallback_path(request_url) if request_url else ""
+    if request_path and request_path != "/" and path != request_path:
+        if request_path in path:
+            path = path.replace(request_path, "/__requested_path__", 1)
+        else:
+            request_name = request_path.rsplit("/", 1)[-1]
+            if len(request_name) >= 6 and request_name in path:
+                path = path.replace(request_name, "__requested_path__", 1)
+    return f"{authority}{path}"
+
+
+def _soft404_normalize(text: str, response_url: str = "", request_url: str = "") -> str:
     value = (text or "").lower()[:65536]
-    parsed = urlparse(response_url or "")
-    replacements = {response_url or "", parsed.path or "", (parsed.path or "").lstrip("/")}
+    replacements = set()
+    for raw_url in (response_url or "", request_url or ""):
+        parsed = urlparse(raw_url)
+        replacements.update({raw_url, parsed.path or "", (parsed.path or "").lstrip("/")})
     for item in sorted((x for x in replacements if len(x) >= 3), key=len, reverse=True):
         value = value.replace(item.lower(), " __requested_path__ ")
     value = re.sub(r"https?://[^\s\"'<>]+", " __url__ ", value)
     value = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", " __token__ ", value)
     value = re.sub(r"\b[0-9a-f]{24,}\b", " __token__ ", value)
     value = re.sub(r"\b\d{7,}\b", " __number__ ", value)
+    value = re.sub(r"(?i)(csrf(?:token)?|nonce|request[-_]?id|token)(\s*[=:]\s*[\"']?)[^\"'\s<>]{6,}", r"\1\2__token__", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
-def _soft404_signature(r) -> dict[str, Any]:
+def _soft404_signature(r, result: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    result = result or {}
+    chain = list(result.get("redirect_chain") or [])
+    final_url = result.get("final_url") or getattr(r, "url", "") or ""
+    request_url = chain[0] if chain else (getattr(r, "url", "") or final_url)
     ct = (r.headers.get("Content-Type", "") or "").lower()
-    normalized = _soft404_normalize(r.text or "", getattr(r, "url", "") or "")
+    normalized = _soft404_normalize(r.text or "", final_url, request_url)
     title_match = re.search(r"<title[^>]*>(.*?)</title>", normalized, re.IGNORECASE | re.DOTALL)
     title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
     return {
@@ -989,7 +1024,23 @@ def _soft404_signature(r) -> dict[str, Any]:
         "normalized": normalized,
         "title": title,
         "hash": hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest() if normalized else "",
+        "redirected": bool(chain),
+        "redirect_count": len(chain),
+        "request_path": _fallback_path(request_url),
+        "final_path": _fallback_path(final_url),
+        "final_destination": _fallback_destination(final_url, request_url),
     }
+
+
+def _soft404_signature_from_value(value) -> Optional[dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, dict) and "response" in value:
+        r = value.get("response")
+        if r is None:
+            return None
+        return _soft404_signature(r, value)
+    return _soft404_signature(value)
 
 
 def text_similarity(a: str, b: str) -> float:
@@ -1000,7 +1051,7 @@ def text_similarity(a: str, b: str) -> float:
     return len(sa & sb) / max(len(sa | sb), 1)
 
 
-def _soft404_signature_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+def _soft404_signature_similarity(a: dict[str, Any], b: dict[str, Any], allow_redirect_destination: bool = True) -> float:
     if not a or not b:
         return 0.0
     if a.get("status") != b.get("status"):
@@ -1009,6 +1060,11 @@ def _soft404_signature_similarity(a: dict[str, Any], b: dict[str, Any]) -> float
     bct = b.get("content_type") or ""
     if act and bct and act != bct:
         return 0.0
+    if allow_redirect_destination and (a.get("redirected") or b.get("redirected")):
+        ad = a.get("final_destination") or ""
+        bd = b.get("final_destination") or ""
+        if ad and ad == bd:
+            return 1.0
     an = a.get("normalized") or ""
     bn = b.get("normalized") or ""
     if not an or not bn:
@@ -1043,19 +1099,35 @@ def get_soft404_baseline(base_url: str):
             r = res.get("response")
             if r is None or res.get("leak"):
                 continue
-            samples.append(_soft404_signature(r))
+            samples.append(_soft404_signature(r, res))
         except Exception:
             continue
-    stable_samples = []
-    for idx, sample in enumerate(samples):
-        if any(
-            idx != other_idx and _soft404_signature_similarity(sample, other) >= 0.82
-            for other_idx, other in enumerate(samples)
-        ):
-            stable_samples.append(sample)
+
+    redirect_counts: dict[str, int] = {}
+    for sample in samples:
+        if sample.get("redirected") and sample.get("final_destination"):
+            key = sample["final_destination"]
+            redirect_counts[key] = redirect_counts.get(key, 0) + 1
+    redirect_destinations = sorted(key for key, count in redirect_counts.items() if count >= 2)
+
+    if redirect_destinations:
+        stable_samples = [sample for sample in samples if sample.get("final_destination") in redirect_destinations]
+        mode = "redirect"
+    else:
+        stable_samples = []
+        for idx, sample in enumerate(samples):
+            if any(
+                idx != other_idx and _soft404_signature_similarity(sample, other, allow_redirect_destination=False) >= 0.82
+                for other_idx, other in enumerate(samples)
+            ):
+                stable_samples.append(sample)
+        mode = "content"
+
     baseline = {
         "stable": len(stable_samples) >= 2,
+        "mode": mode,
         "samples": stable_samples,
+        "redirect_destinations": redirect_destinations,
         "probes": len(probe_paths),
     } if samples else None
     if cache is not None:
@@ -1063,17 +1135,34 @@ def get_soft404_baseline(base_url: str):
     return baseline
 
 
-def looks_like_soft404(r, baseline) -> bool:
-    if not baseline or r is None or not baseline.get("stable"):
+def looks_like_soft404(value, baseline) -> bool:
+    if not baseline or value is None or not baseline.get("stable"):
         return False
-    ct = (r.headers.get("Content-Type", "") or "").lower()
-    if "html" not in ct and "xhtml" not in ct:
+    candidate = _soft404_signature_from_value(value)
+    if not candidate:
         return False
-    candidate = _soft404_signature(r)
+
+    if baseline.get("mode") == "redirect":
+        destinations = set(baseline.get("redirect_destinations") or [])
+        destination = candidate.get("final_destination") or ""
+        if destination and destination in destinations:
+            for sample in baseline.get("samples") or []:
+                if sample.get("final_destination") != destination:
+                    continue
+                if candidate.get("status") != sample.get("status"):
+                    continue
+                candidate_ct = candidate.get("content_type") or ""
+                sample_ct = sample.get("content_type") or ""
+                if candidate_ct and sample_ct and candidate_ct != sample_ct:
+                    continue
+                return True
+        if candidate.get("redirected"):
+            return False
+
     body = candidate.get("normalized") or ""
     generic_marker = bool(re.search(r"(?:\b404\b|not[ -]?found|page does not exist|page unavailable)", body, re.IGNORECASE))
     for sample in baseline.get("samples") or []:
-        score = _soft404_signature_similarity(candidate, sample)
+        score = _soft404_signature_similarity(candidate, sample, allow_redirect_destination=False)
         clen = candidate.get("len", 0) or 0
         slen = sample.get("len", 0) or 0
         length_delta = abs(clen - slen) / max(clen, slen, 1)
@@ -1163,10 +1252,14 @@ def _get_home_fingerprint(base_url: str) -> Optional[str]:
     except Exception:
         return None
 
-def _looks_like_index_redirect_or_soft404(r, soft404_baseline, home_fp: Optional[str]) -> bool:
+def _looks_like_index_redirect_or_soft404(value, soft404_baseline, home_fp: Optional[str]) -> bool:
+    if value is None:
+        return True
+    result = value if isinstance(value, dict) and "response" in value else None
+    r = result.get("response") if result is not None else value
     if r is None:
         return True
-    if looks_like_soft404(r, soft404_baseline):
+    if looks_like_soft404(value, soft404_baseline):
         return True
     try:
         ct = (r.headers.get("Content-Type", "") or "").lower()

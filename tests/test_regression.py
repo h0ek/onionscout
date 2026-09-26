@@ -391,3 +391,90 @@ class Soft404ProbeRegressionTests(unittest.TestCase):
         self.assertEqual(len(baseline["samples"]), 2)
         candidate = response('<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>', 200, url=BASE + "/config.json")
         self.assertTrue(core.looks_like_soft404(candidate, baseline))
+
+    def test_redirect_catchall_common_login_endpoint(self):
+        def fake_fetch(url, **kwargs):
+            final = BASE + "/login?next=" + url[len(BASE):]
+            body = f'<html><title>Sign in</title><body><form><input type="hidden" name="csrf" value="token-{len(url)}-abcdef123456"><p>{url}</p></form></body></html>'
+            return {"response": response(body, 200, url=final), "leak": None, "final_url": final, "redirect_chain": [url]}
+
+        with patch.object(core, "fetch_with_policy", side_effect=fake_fetch):
+            baseline = core.get_soft404_baseline(BASE)
+
+        candidate_url = BASE + "/backup.zip"
+        candidate_final = BASE + "/login?next=/backup.zip"
+        candidate = {
+            "response": response('<html><title>Sign in</title><body><form><input type="hidden" name="csrf" value="completely-different-token"><p>backup request</p></form></body></html>', 200, url=candidate_final),
+            "leak": None,
+            "final_url": candidate_final,
+            "redirect_chain": [candidate_url],
+        }
+        self.assertTrue(baseline["stable"])
+        self.assertEqual(baseline["mode"], "redirect")
+        self.assertTrue(core.looks_like_soft404(candidate, baseline))
+
+    def test_redirect_catchall_homepage_endpoint(self):
+        def fake_fetch(url, **kwargs):
+            final = BASE + "/"
+            return {"response": response('<html><title>Home</title><body>homepage</body></html>', 200, url=final), "leak": None, "final_url": final, "redirect_chain": [url]}
+
+        with patch.object(core, "fetch_with_policy", side_effect=fake_fetch):
+            baseline = core.get_soft404_baseline(BASE)
+
+        candidate = {
+            "response": response('<html><title>Home</title><body>homepage changed</body></html>', 200, url=BASE + "/"),
+            "leak": None,
+            "final_url": BASE + "/",
+            "redirect_chain": [BASE + "/db.sql"],
+        }
+        self.assertTrue(core.looks_like_soft404(candidate, baseline))
+
+    def test_redirect_to_distinct_endpoint_is_not_suppressed(self):
+        login_destination = core._fallback_destination(BASE + "/login?next=/x", BASE + "/missing-x")
+        baseline = {
+            "stable": True,
+            "mode": "redirect",
+            "redirect_destinations": [login_destination],
+            "samples": [
+                core._soft404_signature(
+                    response('<html><title>Sign in</title><body>login</body></html>', 200, url=BASE + "/login?next=/missing-a"),
+                    {"final_url": BASE + "/login?next=/missing-a", "redirect_chain": [BASE + "/missing-a"]},
+                ),
+                core._soft404_signature(
+                    response('<html><title>Sign in</title><body>login</body></html>', 200, url=BASE + "/login?next=/missing-b"),
+                    {"final_url": BASE + "/login?next=/missing-b", "redirect_chain": [BASE + "/missing-b"]},
+                ),
+            ],
+        }
+        candidate = {
+            "response": response('<html><title>Sign in</title><body>login</body></html>', 200, url=BASE + "/admin/login"),
+            "leak": None,
+            "final_url": BASE + "/admin/login",
+            "redirect_chain": [BASE + "/admin"],
+        }
+        self.assertFalse(core.looks_like_soft404(candidate, baseline))
+
+    def test_backup_redirect_catchall_is_suppressed(self):
+        login_destination = core._fallback_destination(BASE + "/login?next=/x", BASE + "/missing-x")
+        baseline_sample = core._soft404_signature(
+            response('<html><title>Sign in</title><body>baseline login</body></html>', 200, url=BASE + "/login?next=/missing"),
+            {"final_url": BASE + "/login?next=/missing", "redirect_chain": [BASE + "/missing"]},
+        )
+        baseline = {
+            "stable": True,
+            "mode": "redirect",
+            "redirect_destinations": [login_destination],
+            "samples": [baseline_sample],
+        }
+        target = BASE + "/backup.zip"
+        final = BASE + "/login?next=/backup.zip"
+        redirected = {
+            "response": response('<html><title>Sign in</title><body>dynamic login body</body></html>', 200, url=final),
+            "leak": None,
+            "final_url": final,
+            "redirect_chain": [target],
+        }
+        with patch.object(files, "_backup_paths_for_profile", return_value=["/backup.zip"]), patch.object(files, "get_soft404_baseline", return_value=baseline), patch.object(files, "fetch_with_policy", return_value=redirected):
+            result = files.check_backup_archives(BASE)
+        self.assertEqual(result["status"], "info")
+        self.assertIn("No backup/archive files detected", str(result["evidence"]))
