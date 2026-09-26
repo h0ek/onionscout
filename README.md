@@ -13,6 +13,7 @@ It is designed as a first-pass audit helper, not a full penetration-testing fram
 ### Network and origin handling
 
 - Tor SOCKS5h support
+- mandatory SOCKS5 preflight with fail-fast before target probing
 - onion v3 address checksum validation
 - smart HTTP/HTTPS origin selection
 - `.onion`-safe redirect policy
@@ -288,7 +289,7 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 -u, --url              Target .onion URL
 --scheme              Origin scheme mode: auto, http, https
 --socks               SOCKS5h proxy, default 127.0.0.1:9050
---skip-tor-check      Skip check.torproject.org connectivity check
+--skip-tor-check      Skip external Tor Project verification; local SOCKS5 preflight still runs
 --http-timeout        HTTP timeout
 --ssh-timeout         SSH timeout
 --tls-timeout         TLS timeout
@@ -322,6 +323,7 @@ Do not share session cookies. They are equivalent to temporary access tokens for
 
 - Most onion services use plain HTTP internally; HTTPS is supported when present.
 - In `auto` mode, onionscout tests available origins and chooses a working HTTP or HTTPS origin.
+- Before origin probing, onionscout requires a working SOCKS5 endpoint and aborts immediately if it is unavailable or invalid. By default it also verifies Tor egress with Tor Project; `--skip-tor-check` skips only that external verification.
 - Redirects are followed only within the approved onion host and port; clearnet and cross-onion redirects are reported, not fetched.
 - Some findings are context-dependent. For example, public social links may be intentional, while active clearnet scripts are usually more relevant for anonymity risk.
 - `basic` is for quick low-noise checks, `safe` is the default, and `extended` increases selected metadata/archive review limits.

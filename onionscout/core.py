@@ -53,10 +53,10 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.4.1
+v0.4.2
 """
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -122,6 +122,33 @@ def configure_tor_proxy(host: str, port: int) -> None:
     proxy = f"socks5h://{host}:{port}"
     session.trust_env = False
     session.proxies = {"http": proxy, "https": proxy}
+
+
+def preflight_tor_socks(host: str, port: int, timeout: float = 5.0) -> None:
+    if not host or not 1 <= port <= 65535:
+        raise ValueError("Invalid SOCKS proxy")
+    timeout = max(0.1, min(float(timeout), 10.0))
+    endpoint = f"{host}:{port}"
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x05\x01\x00")
+            reply = b""
+            while len(reply) < 2:
+                chunk = sock.recv(2 - len(reply))
+                if not chunk:
+                    break
+                reply += chunk
+    except OSError as e:
+        raise RuntimeError(f"Tor SOCKS proxy {endpoint} is unavailable: {e}") from e
+    if len(reply) != 2:
+        raise RuntimeError(f"Tor SOCKS proxy {endpoint} closed during SOCKS5 negotiation")
+    if reply[0] != 0x05:
+        raise RuntimeError(f"Tor SOCKS proxy {endpoint} does not speak SOCKS5")
+    if reply[1] == 0xFF:
+        raise RuntimeError(f"Tor SOCKS proxy {endpoint} rejected the supported SOCKS5 authentication method")
+    if reply[1] != 0x00:
+        raise RuntimeError(f"Tor SOCKS proxy {endpoint} requires unsupported SOCKS5 authentication")
 
 
 def set_cookie_header(cookie_str: str) -> None:

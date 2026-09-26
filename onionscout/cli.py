@@ -76,6 +76,7 @@ from .core import (
     console,
     normalize_url,
     parse_socks,
+    preflight_tor_socks,
     set_cookie_header,
 )
 from .crawler import crawl_finding, indicator_finding
@@ -162,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-s", "--sleep", type=float, default=1.0, help="minimum seconds between HTTP requests (default: 1.0)")
     parser.add_argument("--socks", default="127.0.0.1:9050", help="Tor SOCKS5h proxy (default: 127.0.0.1:9050)")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH port for fingerprint check (default: 22)")
-    parser.add_argument("--skip-tor-check", action="store_true", help="do not call check.torproject.org")
+    parser.add_argument("--skip-tor-check", action="store_true", help="skip external Tor Project verification; local SOCKS5 preflight is always required")
     parser.add_argument("--json", action="store_true", help="output JSON instead of a table")
     parser.add_argument("--html-report", help="write an HTML report to file")
     parser.add_argument("--profile", choices=["basic", "safe", "extended"], default="safe", help="check profile (default: safe)")
@@ -304,9 +305,34 @@ def main() -> None:
             clearnet_url = "https://" + clearnet_url
         cfg.clearnet_url = clearnet_url.rstrip("/")
 
-    socks_host, socks_port = parse_socks(args.socks)
-    cfg.socks_host, cfg.socks_port = socks_host, socks_port
-    configure_tor_proxy(socks_host, socks_port)
+    try:
+        socks_host, socks_port = parse_socks(args.socks)
+        cfg.socks_host, cfg.socks_port = socks_host, socks_port
+        configure_tor_proxy(socks_host, socks_port)
+        preflight_tor_socks(socks_host, socks_port, min(cfg.http_timeout, 5.0))
+    except Exception as e:
+        message = f"Tor SOCKS preflight failed: {e}"
+        if args.json:
+            print(json.dumps({"tool": "onionscout", "version": VERSION, "status": "error", "error": message}, ensure_ascii=False, indent=2))
+        else:
+            console.print(ASCII_LOGO)
+            console.print(f"[red]Error: {message}[/red]")
+            console.print("[red]Scan aborted before contacting the target.[/red]")
+        sys.exit(1)
+
+    if args.skip_tor_check:
+        tor_check_result = finding("SOCKS/Tor connectivity check", "info", "info", "External Tor Project verification skipped; local SOCKS5 preflight passed")
+    else:
+        tor_check_result = check_tor_proxy()
+        if tor_check_result.get("status") != "ok":
+            message = f"Tor connectivity verification failed: {tor_check_result.get('evidence', 'unknown error')}"
+            if args.json:
+                print(json.dumps(make_json_safe({"tool": "onionscout", "version": VERSION, "status": "error", "error": message}), ensure_ascii=False, indent=2))
+            else:
+                console.print(ASCII_LOGO)
+                console.print(f"[red]Error: {message}[/red]")
+                console.print("[red]Scan aborted before contacting the target. Use --skip-tor-check only when external Tor Project verification is intentionally unavailable.[/red]")
+            sys.exit(1)
 
     if args.cookie:
         set_cookie_header(args.cookie)
@@ -338,15 +364,9 @@ def main() -> None:
             js_bundle = collect_javascript_sources(base_url)
         return js_bundle
 
-    tasks: list[dict[str, Any]] = []
-    if not args.skip_tor_check:
-        tasks.append({"key": "tor", "name": "SOCKS/Tor connectivity check", "fn": check_tor_proxy})
-    else:
-        tasks.append({
-            "key": "tor",
-            "name": "SOCKS/Tor connectivity check",
-            "fn": lambda: finding("SOCKS/Tor connectivity check", "info", "info", "Skipped (--skip-tor-check)"),
-        })
+    tasks: list[dict[str, Any]] = [
+        {"key": "tor", "name": "SOCKS/Tor connectivity check", "fn": lambda: tor_check_result},
+    ]
 
     tasks += [
         {"key": "cookie-provided", "name": "Cookie provided", "fn": lambda: check_cookie_present(args.cookie)},
