@@ -189,7 +189,10 @@ def check_csp_related(url: str) -> dict[str, Any]:
                     continue
                 for token in words[1:]:
                     token = token.strip('"\'')
-                    if token.startswith(("*.", "http:", "https:", "//")) or ("." in token and not token.startswith(("'", "data:", "blob:"))):
+                    if token.lower() in {"http:", "https:"}:
+                        clear.append(token.lower())
+                        continue
+                    if token.startswith(("*.", "//")) or ("." in token and not token.startswith(("'", "data:", "blob:"))):
                         candidate = token if token.startswith(("http://", "https://")) else "https://" + token.lstrip("/")
                         if _is_clearnet(candidate):
                             clear.append(candidate)

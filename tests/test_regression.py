@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import io
 import os
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import requests
 
 from onionscout import core
-from onionscout.checks import files, headers, javascript, metadata, web
+from onionscout.checks import files, headers, javascript, metadata, ssh, web
 from onionscout.crawler import crawl_links
 from onionscout.findings import make_json_safe
 from onionscout.history import diff_payloads, target_key
@@ -163,6 +164,53 @@ class RegressionTests(unittest.TestCase):
         with patch.object(headers, "fetch_with_policy", return_value={"response": response(headers_dict={"Content-Security-Policy": "script-src cdn.example.org"}), "leak": None}):
             result = headers.check_csp_related(BASE)
         self.assertEqual(result["status"], "warn")
+
+    def test_csp_scheme_source_not_converted_to_fake_host(self):
+        policy = "default-src 'self'; script-src 'self' https: https://cdn.example.org"
+        with patch.object(headers, "fetch_with_policy", return_value={"response": response(headers_dict={"Content-Security-Policy": policy}), "leak": None}):
+            result = headers.check_csp_related(BASE)
+        evidence = str(result["evidence"])
+        self.assertIn("https:", evidence)
+        self.assertIn("https://cdn.example.org", evidence)
+        self.assertNotIn("https://https:", evidence)
+
+    def test_ssh_paramiko_failure_is_quiet_and_closes_transport(self):
+        created = []
+
+        class DummySocket:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummyTransport:
+            def __init__(self, sock):
+                self.sock = sock
+                self.log_channel = None
+                self.closed = False
+                self.banner_timeout = None
+                created.append(self)
+
+            def set_log_channel(self, channel):
+                self.log_channel = channel
+
+            def start_client(self, timeout=None):
+                import logging
+                logging.getLogger(self.log_channel).error("Error reading SSH protocol banner", exc_info=True)
+                raise RuntimeError("Error reading SSH protocol banner")
+
+            def close(self):
+                self.closed = True
+
+        sock = DummySocket()
+        stderr = io.StringIO()
+        with patch.object(ssh, "_make_tor_socket", return_value=sock), patch.object(ssh.paramiko, "Transport", DummyTransport), contextlib.redirect_stderr(stderr):
+            result = ssh.check_ssh_fingerprint(BASE)
+        self.assertEqual(result["status"], "info")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(created[0].log_channel, "onionscout.paramiko.ssh")
+        self.assertTrue(created[0].closed)
 
     def test_cors_wildcard_credentials_not_high(self):
         with patch.object(headers, "request", return_value=response(headers_dict={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Credentials": "true"})):
