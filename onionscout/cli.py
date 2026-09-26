@@ -295,6 +295,7 @@ def main() -> None:
     cfg.max_duration = max(1.0, args.max_duration)
     cfg.requests_made = 0
     cfg.response_cache = {}
+    cfg.soft404_cache = {}
     cfg.started_at = time.monotonic()
     rebuild_retry_adapter()
     cfg.profile = args.profile

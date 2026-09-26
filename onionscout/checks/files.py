@@ -321,7 +321,9 @@ def _securitytxt_invalid_reason(r) -> Optional[str]:
 def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
     name = f"security.txt ({'root' if path == '/security.txt' else '.well-known'})"
     try:
-        res = fetch_with_policy(f"{base_url.rstrip('/')}{path}")
+        base = base_url.rstrip("/")
+        baseline = get_soft404_baseline(base)
+        res = fetch_with_policy(f"{base}{path}")
         if res.get("leak"):
             return finding(name, "fail", "high", f"{path}: redirect leak → {res['leak']}", raw=res, finding_type="deanon")
         r = res.get("response")
@@ -329,6 +331,8 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
             return finding(name, "warn", "low", f"{path}: no response")
         if r.status_code != 200:
             return finding(name, "info", "info", f"{path}: not found (HTTP {r.status_code})", raw={"status_code": r.status_code})
+        if looks_like_soft404(r, baseline):
+            return finding(name, "info", "info", f"{path}: not found (soft-404/catch-all response)", raw={"status_code": r.status_code, "soft404": True})
         reason = _securitytxt_invalid_reason(r)
         if reason:
             ct = r.headers.get("Content-Type", "") or "n/a"
@@ -350,6 +354,8 @@ def _fetch_security_txt(base_url: str, path: str) -> dict[str, Any]:
 def check_well_known(url: str) -> dict[str, Any]:
     name = "Well-known endpoints"
     try:
+        base = url.rstrip("/")
+        baseline = get_soft404_baseline(base)
         hits = []
         for pth in WELL_KNOWN_PATHS:
             res = fetch_with_policy(f"{url.rstrip('/')}{pth}")
@@ -358,6 +364,8 @@ def check_well_known(url: str) -> dict[str, Any]:
                 continue
             r = res.get("response")
             if r is not None and r.status_code == 200:
+                if looks_like_soft404(r, baseline):
+                    continue
                 ct = (r.headers.get("Content-Type", "") or "").lower()
                 if _looks_like_html(r.content or b"", ct):
                     hits.append(f"{pth} -> 200 but looks like HTML (ct={ct or 'n/a'})")

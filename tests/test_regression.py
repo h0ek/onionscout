@@ -14,7 +14,7 @@ from unittest.mock import patch
 import requests
 
 from onionscout import core
-from onionscout.checks import files, headers, javascript, metadata, ssh, web
+from onionscout.checks import api, files, headers, javascript, metadata, ssh, web
 from onionscout.crawler import crawl_links
 from onionscout.findings import make_json_safe
 from onionscout.history import diff_payloads, target_key
@@ -141,6 +141,75 @@ class RegressionTests(unittest.TestCase):
             result = metadata.check_robots_sitemap(BASE)
         self.assertIn("/private", str(result["evidence"]))
         self.assertNotIn("clearnet URLs", str(result["evidence"]))
+
+    def test_soft404_dynamic_catchall_is_detected_and_cached(self):
+        core.cfg.soft404_cache = {}
+        calls = []
+
+        def fake_fetch(url, **kwargs):
+            calls.append(url)
+            token = url.rsplit("/", 1)[-1]
+            body = f'<!doctype html><html><head><title>404 - Not Found</title></head><body><img src="/static/404.png"><h1>404</h1><p>Page {url} was not found.</p><span>request={token}123456789</span></body></html>'
+            return {"response": response(body, 200, url=url), "leak": None, "final_url": url}
+
+        with patch.object(core, "fetch_with_policy", side_effect=fake_fetch):
+            baseline = core.get_soft404_baseline(BASE)
+            cached = core.get_soft404_baseline(BASE)
+
+        candidate_url = BASE + "/backup.zip"
+        candidate = response('<!doctype html><html><head><title>404 - Not Found</title></head><body><img src="/static/404.png"><h1>404</h1><p>Page ' + candidate_url + ' was not found.</p><span>request=abcdef12345678901234567890</span></body></html>', 200, url=candidate_url)
+        self.assertTrue(baseline["stable"])
+        self.assertIs(baseline, cached)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(core.looks_like_soft404(candidate, baseline))
+
+    def test_soft404_does_not_hide_distinct_real_page(self):
+        samples = [
+            core._soft404_signature(response('<html><head><title>404 - Not Found</title></head><body><h1>404</h1><p>missing page</p></body></html>', 200, url=BASE + "/missing-a")),
+            core._soft404_signature(response('<html><head><title>404 - Not Found</title></head><body><h1>404</h1><p>missing page</p></body></html>', 200, url=BASE + "/missing-b")),
+        ]
+        baseline = {"stable": True, "samples": samples}
+        admin = response('<html><head><title>Admin Login</title></head><body><form><input name="username"><input type="password"></form></body></html>', 200, url=BASE + "/admin")
+        self.assertFalse(core.looks_like_soft404(admin, baseline))
+
+    def test_backup_soft404_is_suppressed(self):
+        samples = [
+            core._soft404_signature(response('<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>', 200, url=BASE + "/missing-a")),
+            core._soft404_signature(response('<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>', 200, url=BASE + "/missing-b")),
+        ]
+        baseline = {"stable": True, "samples": samples}
+        miss = response('<html><title>Not Found</title><body><h1>404</h1><p>missing</p></body></html>', 200, url=BASE + "/backup.zip")
+        with patch.object(files, "_backup_paths_for_profile", return_value=["/backup.zip"]), patch.object(files, "get_soft404_baseline", return_value=baseline), patch.object(files, "fetch_with_policy", return_value={"response": miss, "leak": None}):
+            result = files.check_backup_archives(BASE)
+        self.assertEqual(result["status"], "info")
+        self.assertIn("No backup/archive files detected", str(result["evidence"]))
+
+    def test_api_and_well_known_soft404_are_suppressed(self):
+        samples = [
+            core._soft404_signature(response('<html><title>Page Not Found</title><body><h1>404</h1><p>GraphQL page not found</p></body></html>', 200, url=BASE + "/missing-a")),
+            core._soft404_signature(response('<html><title>Page Not Found</title><body><h1>404</h1><p>GraphQL page not found</p></body></html>', 200, url=BASE + "/missing-b")),
+        ]
+        baseline = {"stable": True, "samples": samples}
+        miss = response('<html><title>Page Not Found</title><body><h1>404</h1><p>GraphQL page not found</p></body></html>', 200, url=BASE + "/graphql")
+        with patch.object(api, "get_soft404_baseline", return_value=baseline), patch.object(api, "fetch_with_policy", return_value={"response": miss, "leak": None}):
+            api_result = api.check_api_exposure(BASE)
+        with patch.object(files, "get_soft404_baseline", return_value=baseline), patch.object(files, "fetch_with_policy", return_value={"response": miss, "leak": None}):
+            well_known_result = files.check_well_known(BASE)
+        self.assertEqual(api_result["status"], "info")
+        self.assertEqual(well_known_result["status"], "info")
+        self.assertIn("No .well-known endpoints found", str(well_known_result["evidence"]))
+
+    def test_securitytxt_soft404_is_not_reported_as_invalid_file(self):
+        samples = [
+            core._soft404_signature(response('<html><title>Not Found</title><body><h1>404</h1></body></html>', 200, url=BASE + "/missing-a")),
+            core._soft404_signature(response('<html><title>Not Found</title><body><h1>404</h1></body></html>', 200, url=BASE + "/missing-b")),
+        ]
+        baseline = {"stable": True, "samples": samples}
+        miss = response('<html><title>Not Found</title><body><h1>404</h1></body></html>', 200, url=BASE + "/.well-known/security.txt")
+        with patch.object(files, "get_soft404_baseline", return_value=baseline), patch.object(files, "fetch_with_policy", return_value={"response": miss, "leak": None}):
+            result = files._fetch_security_txt(BASE, "/.well-known/security.txt")
+        self.assertEqual(result["status"], "info")
+        self.assertIn("soft-404", str(result["evidence"]))
 
     def test_crawler_relative_urls_and_budget(self):
         pages = {BASE + "/": '<a href="/docs/start/">start</a>', BASE + "/docs/start/": '<a href="child">child</a>', BASE + "/docs/start/child": "<p>ok</p>"}

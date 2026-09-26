@@ -15,6 +15,7 @@ import ssl
 import base64
 import hashlib
 import threading
+from difflib import SequenceMatcher
 from html import escape
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -53,10 +54,10 @@ ASCII_LOGO = r"""
 ▐▌ ▐▌█   █ █ ▀▄▄▄▀ █   █      ▝▀▚▖    ▀▄▄▄▀        ▐▌
 ▝▚▄▞▘      █                 ▗▄▄▞▘                 ▐▌
                                                    ▐▌
-v0.4.4
+v0.4.5
 """
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 console = Console()
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -94,6 +95,7 @@ class Config:
     max_duration: float = 900.0
     requests_made: int = 0
     response_cache: Optional[dict] = None
+    soft404_cache: Optional[dict] = None
     started_at: float = 0.0
 
 
@@ -961,17 +963,34 @@ def find_valid_ipv4(text: str) -> Optional[str]:
             return m.group(0)
     return None
 
-def get_soft404_baseline(base_url: str):
-    rand = uuid.uuid4().hex
-    try:
-        r = request("GET", f"{base_url.rstrip('/')}/{rand}", allow_redirects=False)
-        return {
-            "status": r.status_code,
-            "len": len(r.content or b""),
-            "sample": (r.text or "")[:120].lower(),
-        }
-    except Exception:
-        return None
+def _soft404_normalize(text: str, response_url: str = "") -> str:
+    value = (text or "").lower()[:65536]
+    parsed = urlparse(response_url or "")
+    replacements = {response_url or "", parsed.path or "", (parsed.path or "").lstrip("/")}
+    for item in sorted((x for x in replacements if len(x) >= 3), key=len, reverse=True):
+        value = value.replace(item.lower(), " __requested_path__ ")
+    value = re.sub(r"https?://[^\s\"'<>]+", " __url__ ", value)
+    value = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", " __token__ ", value)
+    value = re.sub(r"\b[0-9a-f]{24,}\b", " __token__ ", value)
+    value = re.sub(r"\b\d{7,}\b", " __number__ ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _soft404_signature(r) -> dict[str, Any]:
+    ct = (r.headers.get("Content-Type", "") or "").lower()
+    normalized = _soft404_normalize(r.text or "", getattr(r, "url", "") or "")
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", normalized, re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+    return {
+        "status": r.status_code,
+        "content_type": ct.split(";", 1)[0].strip(),
+        "len": len(r.content or b""),
+        "normalized": normalized,
+        "title": title,
+        "hash": hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest() if normalized else "",
+    }
+
 
 def text_similarity(a: str, b: str) -> float:
     sa = set(re.findall(r"\w+", (a or "").lower()))
@@ -980,24 +999,79 @@ def text_similarity(a: str, b: str) -> float:
         return 0.0
     return len(sa & sb) / max(len(sa | sb), 1)
 
+
+def _soft404_signature_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    if not a or not b:
+        return 0.0
+    if a.get("status") != b.get("status"):
+        return 0.0
+    act = a.get("content_type") or ""
+    bct = b.get("content_type") or ""
+    if act and bct and act != bct:
+        return 0.0
+    an = a.get("normalized") or ""
+    bn = b.get("normalized") or ""
+    if not an or not bn:
+        return 0.0
+    if a.get("hash") and a.get("hash") == b.get("hash"):
+        return 1.0
+    sequence = SequenceMatcher(None, an, bn, autojunk=False).ratio()
+    tokens = text_similarity(an, bn)
+    alen = a.get("len", 0) or 0
+    blen = b.get("len", 0) or 0
+    length_score = 0.0
+    if alen and blen:
+        length_score = 1.0 - min(abs(alen - blen) / max(alen, blen), 1.0)
+    return max(sequence, (tokens * 0.75) + (length_score * 0.25))
+
+
+def get_soft404_baseline(base_url: str):
+    base = base_url.rstrip("/")
+    cache = cfg.soft404_cache
+    if cache is not None and base in cache:
+        return cache[base]
+    tokens = [uuid.uuid4().hex, uuid.uuid4().hex]
+    probe_paths = [f"/.onionscout-missing-{tokens[0]}", f"/.onionscout-missing-{tokens[1]}.zip"]
+    samples = []
+    for path in probe_paths:
+        try:
+            res = fetch_with_policy(base + path)
+            r = res.get("response")
+            if r is None or res.get("leak"):
+                continue
+            samples.append(_soft404_signature(r))
+        except Exception:
+            continue
+    stable = len(samples) >= 2 and _soft404_signature_similarity(samples[0], samples[1]) >= 0.82
+    baseline = {"stable": stable, "samples": samples, "probes": len(probe_paths)} if samples else None
+    if cache is not None:
+        cache[base] = baseline
+    return baseline
+
+
 def looks_like_soft404(r, baseline) -> bool:
-    if not baseline or r is None:
+    if not baseline or r is None or not baseline.get("stable"):
         return False
     ct = (r.headers.get("Content-Type", "") or "").lower()
     if "html" not in ct and "xhtml" not in ct:
         return False
-    blen = baseline.get("len", 0) or 0
-    rlen = len(r.content or b"")
-    if blen > 0:
-        ratio = abs(rlen - blen) / blen
-        if ratio < 0.10 and text_similarity(baseline.get("sample") or "", (r.text or "")[:600]) > 0.80:
+    candidate = _soft404_signature(r)
+    body = candidate.get("normalized") or ""
+    generic_marker = bool(re.search(r"(?:\b404\b|not[ -]?found|page does not exist|page unavailable)", body, re.IGNORECASE))
+    for sample in baseline.get("samples") or []:
+        score = _soft404_signature_similarity(candidate, sample)
+        clen = candidate.get("len", 0) or 0
+        slen = sample.get("len", 0) or 0
+        length_delta = abs(clen - slen) / max(clen, slen, 1)
+        same_title = bool(candidate.get("title") and candidate.get("title") == sample.get("title"))
+        if score >= 0.90:
             return True
-    body = (r.text or "").lower()
-    if baseline.get("status") == r.status_code and ("not found" in body or ">404<" in body or "404 " in body):
-        return True
-    bs = baseline.get("sample") or ""
-    if bs and text_similarity(bs, body[:600]) > 0.80:
-        return True
+        if score >= 0.82 and length_delta <= 0.25:
+            return True
+        if same_title and score >= 0.72 and length_delta <= 0.35:
+            return True
+        if generic_marker and score >= 0.68 and candidate.get("status") == sample.get("status"):
+            return True
     return False
 
 def _resolve_candidates(base_url: str, values: list[str]) -> list[str]:
